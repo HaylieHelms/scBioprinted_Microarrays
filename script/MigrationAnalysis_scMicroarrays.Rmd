@@ -1,0 +1,5291 @@
+---
+title: "Single-Cell Cell-Cell Interaction Arrays - Migration Analysis" 
+author: "Haylie Helms"
+date: "2025-10-29"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    keep_tex: true
+  html_document: default
+geometry: margin=1in
+fontsize: 11pt
+mainfont: Arial
+monofont: Menlo
+header-includes:
+  - \usepackage{microtype}
+  - \usepackage{xurl}
+  - \usepackage{fvextra}
+  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines=true,breakanywhere=true,commandchars=\\\{\}}
+  - \sloppy
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(readxl)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(janitor) 
+library(purrr)
+library(readr)
+library(ggpubr)
+library(geometry)
+library(tidyr)
+library(scales)
+library(RANN)
+
+# Plot Formatting
+celltype_colors <- c(
+  "MDAMB231"     = "#B64249",
+  "Myoepithelial"= "#796089",
+  "Fibroblast"   = "#718F77",
+  "Missing_ID"   = "#AFABAB")
+
+group_colors <- c("Den1" = "#DD9358", "Den10" = "#6A7AA1")
+
+point_colors <- c("Den1" = "#D6986A", "Den10" = "#6B748D")
+```
+
+# Cancer Density
+## Load & preprocess data
+```{r}
+folder <- "/Users/helmsh/Desktop/"
+
+files <- c(
+  "Den1S1.xlsx","Den1S2.xlsx","Den1S3.xlsx",
+  "Den10S1.xlsx","Den10S2.xlsx","Den10S3.xlsx")
+
+# Extract sample names
+sample_names <- files %>%
+  str_remove("^Den") %>%
+  str_remove("\\.xlsx$")
+
+# Load each file, read the "Position" sheet, skip row 1 (a header), treat everything as text, rename column 7 to CellTypeID (inconsistent naming during export), and add the sample name as a new column
+data_list <- lapply(seq_along(files), function(i) {
+  read_excel(
+    path = file.path(folder, files[i]),
+    sheet = "Position",
+    skip = 1,
+    col_types = "text"
+  ) %>%
+    rename(CellTypeID = 7) %>%
+    mutate(SampleID = sample_names[i])  # add the sample name as a column
+})
+
+# Combine into one dataframe
+all_positions <- bind_rows(data_list)
+```
+
+```{r}
+head(all_positions)
+unique(all_positions$CellTypeID)
+unique(all_positions$SampleID)
+```
+
+```{r}
+# Issue with file export from Imaris. The annotations have different names. Create function to deal with that
+
+all_positions <- all_positions %>%
+  mutate(
+    CellTypeID = case_when(
+      grepl("^MDA", CellTypeID, ignore.case = TRUE) ~ "MDAMB231",
+      grepl("^Myo", CellTypeID, ignore.case = TRUE) ~ "Myoepithelial",
+      is.na(CellTypeID) ~ "Missing_ID",
+      TRUE ~ CellTypeID))
+
+unique(all_positions$CellTypeID)
+```
+
+```{r}
+## Add Unique ID - Imaris reuses track ID's across files
+all_positions <- all_positions %>%
+  mutate(UniqueID = paste(SampleID, TrackID, sep = "_"))
+
+head(all_positions)
+```
+
+```{r}
+# Confirm we got all of them. These datasets have 145 frames. So the max shown should be 145 instances. If there are more that means there is a duplicate still
+all_positions %>% 
+  count(UniqueID) %>% 
+  arrange(desc(n))
+```
+
+```{r}
+## Inspecting missing track annotations
+missing_tracks <- all_positions %>%
+  filter(CellTypeID == "Missing_ID") %>%
+  distinct(SampleID, UniqueID)
+
+missing_tracks
+n_missing <- nrow(missing_tracks)
+n_missing
+```
+
+```{r}
+# Remove spaces in col names, i.e. "Position X" to "X_Position". Spaces cause problems. Also renaming ID because it seemed to want to pull functions instead of data
+all_positions <- all_positions %>%
+  rename(
+    X_Position = `Position X`,
+    Y_Position = `Position Y`,
+    SpotID     = `ID`)
+
+head(all_positions)
+```
+
+```{r}
+# Make SpotID all the same number of characters
+all_positions$SpotID <- str_pad(all_positions$SpotID, width = 6, side = "left", pad = "0")
+
+head(all_positions)
+```
+
+```{r}
+# One of the short track ID's is 000000. Rename to 999999
+all_positions$SpotID[all_positions$SpotID == "000000"] <- "999999"
+
+head(all_positions)
+```
+
+```{r}
+# Make time all the same number of characters
+all_positions$Time <- str_pad(all_positions$Time, width = 3, side = "left", pad = "0")
+
+head(all_positions)
+```
+
+```{r}
+# Reorder so it is easier to work with
+all_positions_cleaned <- all_positions %>%
+  select(SampleID, UniqueID, CellTypeID, Time, X_Position, Y_Position, Unit, Category, Collection, TrackID, SpotID)
+
+head(all_positions_cleaned)
+```
+
+```{r}
+# Rearrange so that is sorted by SampleID, then UniqueID, then Time so we can separate out the duplicates
+all_positions_cleaned <- all_positions_cleaned %>% arrange(SampleID, UniqueID, Time)
+
+head(all_positions_cleaned)
+```
+
+
+```{r}
+## Add in Group - Den1 vs Den10
+Combined_Positions <- all_positions_cleaned %>%
+  mutate(
+    Group = case_when(
+      str_starts(SampleID, "1S")  ~ "Den1",
+      str_starts(SampleID, "10S") ~ "Den10",
+      TRUE ~ NA_character_ ))
+
+head(Combined_Positions)
+```
+
+## Analysis
+### 1.) Migration Tracks
+##### Every Sample Individually, Each Channel, and Merged
+```{r}
+Combined_Positions <- Combined_Positions %>%
+  mutate(
+    TimeNum = as.integer(Time),
+    X = as.numeric(X_Position),
+    Y = as.numeric(Y_Position)
+  ) %>%
+  arrange(SampleID, UniqueID, TimeNum)
+
+# helper for clean numeric labels
+.lab_int <- function(x) format(round(x), trim = TRUE, scientific = FALSE,
+                               big.mark = "", decimal.mark = ".")
+
+make_sample_plot <- function(df, sample_name, title_text,
+                             span_x = 800, span_y = 800, tick = 200) {
+
+  lims <- dplyr::filter(sample_limits, SampleID == sample_name)
+  stopifnot(nrow(lims) == 1)
+
+  # default: centered 800×800
+  xlim <- c(lims$xmid - span_x/2, lims$xmid + span_x/2)
+  ylim <- c(lims$ymid - span_y/2, lims$ymid + span_y/2)
+
+  # shift 1S1 vertically so ymin touches x-axis
+  if (identical(sample_name, "1S1")) {
+    ylim <- c(lims$ymin0, lims$ymin0 + span_y)
+  }
+
+  x_breaks <- seq(xlim[1], xlim[2], by = tick)
+  y_breaks <- seq(ylim[1], ylim[2], by = tick)
+
+  ggplot(df, aes(x = X, y = Y, group = UniqueID, color = CellTypeID)) +
+    geom_path(linewidth = 0.6, alpha = 0.6, na.rm = TRUE) +
+    coord_equal() +
+    scale_color_manual(values = celltype_colors) +
+    scale_x_continuous(limits = xlim, breaks = x_breaks, labels = .lab_int,
+                       expand = c(0, 0), name = expression(X~(mu*m))) +
+    scale_y_continuous(limits = ylim, breaks = y_breaks, labels = .lab_int,
+                       expand = c(0, 0), name = expression(Y~(mu*m))) +
+    theme_classic(base_size = 20) +
+    theme(legend.position = "none",
+          axis.title = element_text(size = 20),
+          axis.text  = element_text(size = 20),
+          plot.title = element_text(size = 20, face = "bold")) +
+    labs(title = title_text)
+}
+
+
+# Loop & save
+sample_limits <- Combined_Positions %>%
+  group_by(SampleID) %>%
+  summarise(
+    xmin  = min(X, na.rm = TRUE),
+    xmax  = max(X, na.rm = TRUE),
+    ymin  = min(Y, na.rm = TRUE),
+    ymax  = max(Y, na.rm = TRUE),
+    xmid  = (xmin + xmax) / 2,
+    ymid  = (ymin + ymax) / 2,
+    ymin0 = ymin,
+    .groups = "drop")
+
+unique_samples <- unique(Combined_Positions$SampleID)
+
+for (s in unique_samples) {
+  df_s <- dplyr::filter(Combined_Positions, SampleID == s)
+
+  p_all <- make_sample_plot(df_s, s, paste0(s, " — All Tracks (Raw)"))
+  ggsave(paste0(s, "_Raw_All_Tracks.png"), p_all, width = 6, height = 4, dpi = 600)
+
+  p_mda <- make_sample_plot(dplyr::filter(df_s, CellTypeID == "MDAMB231"),
+                            s, paste0(s, " — MDAMB231 Tracks (Raw)"))
+  ggsave(paste0(s, "_Raw_MDAMB231_Tracks.png"), p_mda, width = 6, height = 4, dpi = 600)
+
+  p_myo <- make_sample_plot(dplyr::filter(df_s, CellTypeID == "Myoepithelial"),
+                            s, paste0(s, " — Myoepithelial Tracks (Raw)"))
+  ggsave(paste0(s, "_Raw_Myoepithelial_Tracks.png"), p_myo, width = 6, height = 4, dpi = 600)
+}
+```
+
+#### Center Aligned
+```{r}
+# Translate each Sample so their bounding boxes are all centered
+
+# Numeric coords
+CP_num <- Combined_Positions %>%
+  mutate(
+    X = as.numeric(X_Position),
+    Y = as.numeric(Y_Position),
+    TimeN = as.integer(Time)
+  )
+
+# Center each SampleID directly by subtracting its bbox midpoint
+aligned <- CP_num %>%
+  group_by(SampleID) %>%
+  mutate(
+    x_mid = (min(X, na.rm = TRUE) + max(X, na.rm = TRUE)) / 2,
+    y_mid = (min(Y, na.rm = TRUE) + max(Y, na.rm = TRUE)) / 2,
+    x_centered = X - x_mid,
+    y_centered = Y - y_mid
+  ) %>%
+  ungroup()
+
+# One-off vertical shift for 1S1 so ymin == -450 on the fixed axes
+if ("1S1" %in% aligned$SampleID) {
+  ymin_1S1 <- aligned %>%
+    dplyr::filter(SampleID == "1S1") %>%
+    summarise(min_y = min(y_centered, na.rm = TRUE)) %>%
+    pull(min_y)
+
+  shift_1S1 <- (-450) - ymin_1S1  # amount to add so min becomes -450
+
+  aligned <- aligned %>%
+    mutate(y_centered = ifelse(SampleID == "1S1",
+                               y_centered + shift_1S1,
+                               y_centered))
+}
+
+# Sanity check of global bounds (after centering each sample)
+aligned %>%
+  summarise(
+    xmin = min(x_centered, na.rm = TRUE),
+    xmax = max(x_centered, na.rm = TRUE),
+    ymin = min(y_centered, na.rm = TRUE),
+    ymax = max(y_centered, na.rm = TRUE)
+  )
+
+```
+
+##### Aligned - Cycle through all plot variations
+```{r}
+plot_tracks_fixed <- function(df) {
+  ggplot(
+    df,
+    aes(
+      x = x_centered,
+      y = y_centered,
+      group = interaction(SampleID, UniqueID),
+      color = CellTypeID
+    )
+  ) +
+    geom_path(linewidth = 0.6, alpha = 0.6, na.rm = TRUE) +
+    coord_equal() +
+    scale_x_continuous(
+      limits = c(-445, 450),
+      breaks  = c(-400, -200, 0, 200, 400),
+      expand  = c(0, 0)
+    ) +
+    scale_y_continuous(
+      limits = c(-450, 450),
+      breaks  = c(-400, -200, 0, 200, 400),
+      expand  = c(0, 0)
+    ) +
+    scale_color_manual(values = celltype_colors) +
+    theme_classic(base_size = 20) +
+    theme(
+      legend.position = "none",         
+      plot.title      = element_blank(), 
+      axis.title      = element_text(size = 20),
+      axis.text       = element_text(size = 20),
+      plot.margin     = unit(c(8, 8, 8, 8), "pt")
+    ) +
+    labs(
+      x = "X (µm)",
+      y = "Y (µm)"
+    )
+}
+
+den1  <- aligned %>% filter(Group == "Den1")
+den10 <- aligned %>% filter(Group == "Den10")
+
+# Den1
+p_den1_all <- plot_tracks_fixed(den1)
+p_den1_mda <- plot_tracks_fixed(den1 %>% filter(CellTypeID == "MDAMB231"))
+p_den1_myo <- plot_tracks_fixed(den1 %>% filter(CellTypeID == "Myoepithelial"))
+
+ggsave("Den1_Aligned_All_Tracks.png",           p_den1_all, width = 7, height = 6, dpi = 600)
+ggsave("Den1_Aligned_MDAMB231_Tracks.png",      p_den1_mda, width = 7, height = 6, dpi = 600)
+ggsave("Den1_Aligned_Myoepithelial_Tracks.png", p_den1_myo, width = 7, height = 6, dpi = 600)
+
+# Den10
+p_den10_all <- plot_tracks_fixed(den10)
+p_den10_mda <- plot_tracks_fixed(den10 %>% filter(CellTypeID == "MDAMB231"))
+p_den10_myo <- plot_tracks_fixed(den10 %>% filter(CellTypeID == "Myoepithelial"))
+
+ggsave("Den10_Aligned_All_Tracks.png",           p_den10_all, width = 7, height = 6, dpi = 600)
+ggsave("Den10_Aligned_MDAMB231_Tracks.png",      p_den10_mda, width = 7, height = 6, dpi = 600)
+ggsave("Den10_Aligned_Myoepithelial_Tracks.png", p_den10_myo, width = 7, height = 6, dpi = 600)
+
+# Per sample exports
+samples <- sort(unique(aligned$SampleID))
+
+for (s in samples) {
+  d <- aligned %>% filter(SampleID == s)
+
+  p_all <- plot_tracks_fixed(d)
+  p_mda <- plot_tracks_fixed(d %>% filter(CellTypeID == "MDAMB231"))
+  p_myo <- plot_tracks_fixed(d %>% filter(CellTypeID == "Myoepithelial"))
+
+  ggsave(paste0(s, "_Aligned_All_Tracks.png"),           p_all, width = 6, height = 6, dpi = 600)
+  ggsave(paste0(s, "_Aligned_MDAMB231_Tracks.png"),      p_mda, width = 6, height = 6, dpi = 600)
+  ggsave(paste0(s, "_Aligned_Myoepithelial_Tracks.png"), p_myo, width = 6, height = 6, dpi = 600)
+}
+```
+
+#### Relative Position
+```{r}
+Combined_Positions_Relative <- Combined_Positions %>%
+  mutate(
+    Xnum = as.numeric(X_Position),
+    Ynum = as.numeric(Y_Position),
+    Tnum = as.integer(Time)
+  ) %>%
+  arrange(SampleID, UniqueID, Tnum) %>%
+  group_by(SampleID, UniqueID) %>%
+  # anchor each track at its first *observed* (non-NA) position
+  mutate(
+    .x0 = {
+      ix <- which(!is.na(Xnum))
+      if (length(ix)) Xnum[ix[1]] else NA_real_
+    },
+    .y0 = {
+      iy <- which(!is.na(Ynum))
+      if (length(iy)) Ynum[iy[1]] else NA_real_
+    },
+    RelX = Xnum - .x0,
+    RelY = Ynum - .y0
+  ) %>%
+  ungroup() %>%
+  select(
+    # keep your columns in order
+    SampleID, UniqueID, CellTypeID, Time,
+    X_Position, Y_Position, Unit, Category, Collection, SpotID,
+    dplyr::any_of("Group"),
+    RelX, RelY
+  )
+
+# Sanity check: first point of every track should be (0,0)
+Combined_Positions_Relative %>%
+  group_by(SampleID, UniqueID) %>%
+  slice(1) %>%
+  summarise(first_RelX = first(RelX), first_RelY = first(RelY), .groups = "drop") %>%
+  summarise(
+    n_tracks = n(),
+    n_zero_start = sum(first_RelX == 0 & first_RelY == 0, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  print()
+```
+
+```{r}
+# Figure out min max for myoeps to set the axis properly
+myoep_pos <- Combined_Positions_Relative %>%
+  dplyr::filter(CellTypeID == "Myoepithelial")
+
+myoep_maxvals <- myoep_pos %>%
+  dplyr::summarise(
+    min_RelX = min(RelX, na.rm = TRUE),
+    max_RelX = max(RelX, na.rm = TRUE),
+    min_RelY = min(RelY, na.rm = TRUE),
+    max_RelY = max(RelY, na.rm = TRUE)
+  )
+
+myoep_maxvals
+```
+
+```{r}
+# Cycle through all the combos - relative position 
+CP_rel <- Combined_Positions_Relative %>%
+  dplyr::mutate(
+    RelX   = as.numeric(RelX),
+    RelY   = as.numeric(RelY)
+  )
+
+plot_tracks_rel_fixed <- function(df, title, show_legend = TRUE) {
+  ggplot(
+    df,
+    aes(
+      x = RelX,
+      y = RelY,
+      group = interaction(SampleID, UniqueID),
+      color = CellTypeID
+    )
+  ) +
+    geom_path(linewidth = 0.6, alpha = 0.6, na.rm = TRUE) +
+    guides(color = guide_legend(override.aes = list(linewidth = 2))) +
+    coord_equal() +
+    scale_x_continuous(
+      limits = c(-600, 600),
+      breaks  = c(-600, -300, 0, 300, 600),
+      expand  = c(0, 0)
+    ) +
+    scale_y_continuous(
+      limits = c(-600, 600),
+      breaks  = c(-600, -300, 0, 300, 600),
+      expand  = c(0, 0)
+    ) +
+    scale_color_manual(values = celltype_colors) +
+    theme_classic(base_size = 22) +
+    theme(
+      axis.line    = element_line(linewidth = 0.8, color = "black"),
+      axis.text.y  = element_text(size = 14),
+      axis.title.y = element_text(size = 16),
+      axis.text.x  = element_text(size = 14, hjust = 0.5),
+      axis.title.x = element_text(size = 16),
+      plot.title   = element_text(size = 16, hjust = 0.5),
+      legend.title      = element_text(size = 16),
+      legend.text       = element_text(size = 14),
+      legend.key.height = unit(30, "pt"),
+      legend.key.width  = unit(30, "pt"),
+      legend.position   = if (show_legend) "right" else "none"
+    ) +
+    labs(
+      title = title,
+      x = "Relative X Position (µm)",
+      y = "Relative Y Position (µm)",
+      color = "Track Identity"
+    )
+}
+
+den1_rel  <- CP_rel %>% dplyr::filter(Group == "Den1")
+den10_rel <- CP_rel %>% dplyr::filter(Group == "Den10")
+
+# Den1
+p_den1_all_rel <- plot_tracks_rel_fixed(den1_rel,  "Den1 — Relative: All Tracks", show_legend = TRUE)
+p_den1_mda_rel <- plot_tracks_rel_fixed(
+  den1_rel %>% dplyr::filter(CellTypeID == "MDAMB231"),
+  "Den1 — Relative: MDAMB231 Tracks",
+  show_legend = TRUE
+)
+p_den1_myo_rel <- plot_tracks_rel_fixed(
+  den1_rel %>% dplyr::filter(CellTypeID == "Myoepithelial"),
+  "Den1 — Relative: Myoepithelial Tracks",
+  show_legend = TRUE
+)
+
+ggsave("Den1_Relative_All_Tracks.png",           p_den1_all_rel, width = 7, height = 6, dpi = 600)
+ggsave("Den1_Relative_MDAMB231_Tracks.png",      p_den1_mda_rel, width = 7, height = 6, dpi = 600)
+ggsave("Den1_Relative_Myoepithelial_Tracks.png", p_den1_myo_rel, width = 7, height = 6, dpi = 600)
+
+# Den10
+p_den10_all_rel <- plot_tracks_rel_fixed(den10_rel, "Den10 — Relative: All Tracks", show_legend = TRUE)
+p_den10_mda_rel <- plot_tracks_rel_fixed(
+  den10_rel %>% dplyr::filter(CellTypeID == "MDAMB231"),
+  "Den10 — Relative: MDAMB231 Tracks",
+  show_legend = TRUE
+)
+p_den10_myo_rel <- plot_tracks_rel_fixed(
+  den10_rel %>% dplyr::filter(CellTypeID == "Myoepithelial"),
+  "Den10 — Relative: Myoepithelial Tracks",
+  show_legend = TRUE
+)
+
+ggsave("Den10_Relative_All_Tracks.png",           p_den10_all_rel, width = 7, height = 6, dpi = 600)
+ggsave("Den10_Relative_MDAMB231_Tracks.png",      p_den10_mda_rel, width = 7, height = 6, dpi = 600)
+ggsave("Den10_Relative_Myoepithelial_Tracks.png", p_den10_myo_rel, width = 7, height = 6, dpi = 600)
+
+# Per sample exports
+samples_rel <- sort(unique(CP_rel$SampleID))
+
+for (s in samples_rel) {
+  d <- CP_rel %>% dplyr::filter(SampleID == s)
+
+  p_all <- plot_tracks_rel_fixed(d,  paste0(s, " — Relative: All Tracks"),       show_legend = FALSE)
+  p_mda <- plot_tracks_rel_fixed(d %>% dplyr::filter(CellTypeID == "MDAMB231"),
+                                 paste0(s, " — Relative: MDAMB231 Tracks"),
+                                 show_legend = FALSE)
+  p_myo <- plot_tracks_rel_fixed(d %>% dplyr::filter(CellTypeID == "Myoepithelial"),
+                                 paste0(s, " — Relative: Myoepithelial Tracks"),
+                                 show_legend = FALSE)
+
+  ggsave(paste0(s, "_Relative_All_Tracks.png"),           p_all, width = 6, height = 6, dpi = 600)
+  ggsave(paste0(s, "_Relative_MDAMB231_Tracks.png"),      p_mda, width = 6, height = 6, dpi = 600)
+  ggsave(paste0(s, "_Relative_Myoepithelial_Tracks.png"), p_myo, width = 6, height = 6, dpi = 600)
+}
+```
+
+
+
+
+
+
+### 2.) Convex Hull - Migration territory 
+```{r}
+Combined_Positions_Relative <- Combined_Positions_Relative %>%
+  dplyr::mutate(
+    Group = dplyr::case_when(
+      stringr::str_starts(SampleID, "1S")  ~ "Den1",
+      stringr::str_starts(SampleID, "10S") ~ "Den10",
+      TRUE ~ NA_character_
+    ),
+    Group = factor(Group, levels = c("Den1", "Den10"))
+  )
+
+# Per-track convex hull areas
+ConvexAreas <- Combined_Positions_Relative %>%
+  dplyr::group_by(SampleID, UniqueID, CellTypeID, Group) %>%
+  dplyr::summarise(
+    area = {
+      pts <- cbind(RelX, RelY)
+      pts <- pts[stats::complete.cases(pts), , drop = FALSE]
+      if (nrow(pts) < 3) NA_real_ else geometry::convhulln(pts, "FA")$area
+    },
+    .groups = "drop"
+  )
+
+# Helpers for hull polygons
+hull_df <- function(df, x = "RelX", y = "RelY") {
+  pts <- df[, c(x, y)]
+  pts <- pts[stats::complete.cases(pts), , drop = FALSE]
+  if (nrow(pts) < 3) return(NULL)
+  idx <- grDevices::chull(pts[[1]], pts[[2]])
+  out <- pts[idx, , drop = FALSE]
+  rbind(out, out[1, , drop = FALSE]) # close polygon
+}
+
+build_per_track_hulls <- function(dat) {
+  dat %>%
+    dplyr::group_by(SampleID, UniqueID, CellTypeID) %>%
+    dplyr::group_modify(~{
+      h <- hull_df(.x, "RelX", "RelY")
+      if (is.null(h)) return(tibble::tibble(RelX = numeric(0), RelY = numeric(0)))
+      tibble::tibble(RelX = h$RelX, RelY = h$RelY)
+    }) %>%
+    dplyr::ungroup()
+}
+
+build_sample_hull <- function(dat) {
+  h <- hull_df(dat, "RelX", "RelY")
+  if (is.null(h)) return(NULL)
+  tibble::tibble(RelX = h$RelX, RelY = h$RelY)
+}
+
+base_style <- function(show_legend = FALSE) {
+  ggplot2::theme_classic(base_size = 20) +
+    ggplot2::theme(
+      legend.position = if (show_legend) "right" else "none",
+      axis.title = ggplot2::element_text(size = 20),
+      axis.text  = ggplot2::element_text(size = 20),
+      plot.title = ggplot2::element_text(size = 20, face = "bold"),
+      plot.margin = ggplot2::margin(10, 10, 10, 10)
+    )
+}
+
+# Plot one sample with per-track hulls + sample hull, with flexible axis breaks 
+plot_sample_with_hulls <- function(sample_id,
+                                   cell_filter = c("ALL", "MDAMB231", "Myoepithelial"),
+                                   per_track_hulls = TRUE,
+                                   sample_hull = TRUE,
+                                   fixed_limits = c(-300, 300, -300, 300),
+                                   axis_breaks  = c(-300, -150, 0, 150, 300),
+                                   show_legend = FALSE) {
+
+  cell_filter <- match.arg(cell_filter)
+
+  df <- Combined_Positions_Relative %>% dplyr::filter(SampleID == sample_id)
+  if (cell_filter != "ALL") df <- df %>% dplyr::filter(CellTypeID == cell_filter)
+  if (!nrow(df)) return(ggplot2::ggplot() + ggplot2::ggtitle(paste0(sample_id, " — EMPTY")))
+
+  per_track <- if (per_track_hulls) build_per_track_hulls(df) else NULL
+  smp_hull  <- if (sample_hull)      build_sample_hull(df)    else NULL
+
+  xlim <- fixed_limits[1:2]
+  ylim <- fixed_limits[3:4]
+
+  p <- ggplot2::ggplot(df, ggplot2::aes(x = RelX, y = RelY, group = UniqueID, color = CellTypeID)) +
+    ggplot2::geom_path(linewidth = 0.6, alpha = 0.6, na.rm = TRUE) +
+    # keep aspect ratio square and allow limiting without dropping points
+    ggplot2::coord_cartesian(xlim = xlim, ylim = ylim, clip = "off") +
+    ggplot2::scale_x_continuous(breaks = axis_breaks, expand = c(0, 0)) +
+    ggplot2::scale_y_continuous(breaks = axis_breaks, expand = c(0, 0)) +
+    ggplot2::scale_color_manual(values = celltype_colors) +
+    ggplot2::scale_fill_manual(values = celltype_colors) +
+    ggplot2::labs(
+      title = paste0(sample_id, " — Convex Hull Area, Relative XY (", cell_filter, ")"),
+      x = "Relative X Position (µm)",
+      y = "Relative Y Position (µm)",
+      color = "Cell Type"
+    ) +
+    base_style(show_legend)
+
+  # enforce equal scaling after coord_cartesian (one coord system only)
+  p <- p + ggplot2::coord_fixed(ratio = 1, xlim = xlim, ylim = ylim, clip = "off")
+
+  if (!is.null(per_track) && nrow(per_track)) {
+    per_track <- per_track %>%
+      dplyr::left_join(df %>% dplyr::distinct(SampleID, UniqueID, CellTypeID),
+                       by = c("SampleID", "UniqueID", "CellTypeID"))
+
+    p <- p +
+      ggplot2::geom_polygon(
+        data = per_track,
+        ggplot2::aes(x = RelX, y = RelY, group = UniqueID, fill = CellTypeID, color = CellTypeID),
+        linewidth = 0.4, alpha = 0.15, inherit.aes = FALSE
+      )
+  }
+
+  if (!is.null(smp_hull)) {
+    p <- p +
+      ggplot2::geom_path(
+        data = smp_hull, ggplot2::aes(x = RelX, y = RelY),
+        color = "black", linewidth = 1.4, inherit.aes = FALSE
+      )
+  }
+
+  p
+}
+```
+
+#### Hull Viz
+```{r}
+samples <- sort(unique(Combined_Positions_Relative$SampleID))
+
+for (s in samples) {
+
+  # MDAMB231
+  ggplot2::ggsave(
+    paste0(s, "_Rel_MDAMB231_withHulls_fixed300.png"),
+    plot_sample_with_hulls(
+      s, "MDAMB231",
+      fixed_limits = c(-300, 300, -300, 300),
+      axis_breaks  = c(-300, -150, 0, 150, 300),
+      per_track_hulls = TRUE,
+      sample_hull = TRUE
+    ),
+    width = 7, height = 6, dpi = 600
+  )
+
+  # Myoep
+  ggplot2::ggsave(
+    paste0(s, "_Rel_Myoepithelial_withHulls_fixed600.png"),
+    plot_sample_with_hulls(
+      s, "Myoepithelial",
+      fixed_limits = c(-600, 600, -600, 600),
+      axis_breaks  = c(-600, -300, 0, 300, 600),
+      per_track_hulls = TRUE,
+      sample_hull = TRUE
+    ),
+    width = 7, height = 6, dpi = 600
+  )
+}
+```
+
+
+##### Grouped on one plot
+```{r}
+build_sample_hulls <- function(dat, cell_filter = "MDAMB231") {
+  df <- dat
+  if (!identical(cell_filter, "ALL")) {
+    df <- df %>% dplyr::filter(CellTypeID == cell_filter)
+  }
+
+  df %>%
+    dplyr::group_by(Group, SampleID) %>%
+    dplyr::group_modify(~{
+      h <- hull_df(.x, "RelX", "RelY")
+      if (is.null(h)) return(tibble::tibble(RelX = numeric(0), RelY = numeric(0)))
+      tibble::tibble(RelX = h$RelX, RelY = h$RelY)
+    }) %>%
+    dplyr::ungroup() %>%
+    dplyr::filter(!(is.na(RelX) | is.na(RelY)))
+}
+
+plot_group_hull_overlays <- function(hulls_df,
+                                     group_name = c("Den1", "Den10"),
+                                     fixed_limits = c(-300, 300, -300, 300),
+                                     axis_breaks  = c(-300, -150, 0, 150, 300),
+                                     title = NULL,
+                                     show_legend = TRUE,
+                                     outline_col = "#B64249") {
+
+  group_name <- match.arg(group_name)
+
+  h <- hulls_df %>% dplyr::filter(Group == group_name)
+  if (!nrow(h)) return(ggplot2::ggplot() + ggplot2::ggtitle(paste0(group_name, " — EMPTY")))
+
+  samples <- sort(unique(h$SampleID))
+  sfx <- sub("^.*S(\\d)$", "\\1", samples)
+  style_by_suffix <- c("1" = "solid", "2" = "longdash", "3" = "1212")
+  lt_vals <- style_by_suffix[sfx]
+  lt_vals[is.na(lt_vals)] <- "solid"
+  lt_map <- setNames(lt_vals, samples)
+
+  fill_cols <- setNames(rep(outline_col, length(samples)), samples)
+
+  xlim <- fixed_limits[1:2]
+  ylim <- fixed_limits[3:4]
+
+  p <- ggplot2::ggplot(h, ggplot2::aes(x = RelX, y = RelY, group = SampleID)) +
+    ggplot2::geom_polygon(ggplot2::aes(fill = SampleID), alpha = 0.22, color = NA) +
+    ggplot2::geom_path(ggplot2::aes(linetype = SampleID), color = outline_col, linewidth = 1.6) +
+    ggplot2::scale_linetype_manual(values = lt_map, drop = FALSE) +
+    ggplot2::scale_fill_manual(values = fill_cols, drop = FALSE) +
+    ggplot2::scale_x_continuous(breaks = axis_breaks, expand = c(0, 0)) +
+    ggplot2::scale_y_continuous(breaks = axis_breaks, expand = c(0, 0)) +
+    ggplot2::labs(
+      title = if (is.null(title)) paste0(group_name, " Sample Hull Overlays") else title,
+      x = "Relative X Position (µm)",
+      y = "Relative Y Position (µm)",
+      linetype = "Sample",
+      fill = "Sample"
+    ) +
+    ggplot2::theme_classic(base_size = 22) +
+    ggplot2::theme(
+      legend.position = if (show_legend) "right" else "none",
+      axis.title = ggplot2::element_text(size = 20),
+      axis.text  = ggplot2::element_text(size = 18),
+      plot.title = ggplot2::element_text(size = 22, face = "bold"),
+      plot.margin = ggplot2::margin(10, 10, 10, 10)
+    )
+
+  # one coord system, with equal scaling
+  p + ggplot2::coord_fixed(ratio = 1, xlim = xlim, ylim = ylim, clip = "off")
+}
+
+sample_hulls_MDA <- build_sample_hulls(Combined_Positions_Relative, cell_filter = "MDAMB231")
+sample_hulls_Myo <- build_sample_hulls(Combined_Positions_Relative, cell_filter = "Myoepithelial")
+
+# MDAMB231 overlays (±300)
+p_den1_hull_MDA <- plot_group_hull_overlays(
+  sample_hulls_MDA, "Den1",
+  fixed_limits = c(-300, 300, -300, 300),
+  axis_breaks  = c(-300, -150, 0, 150, 300),
+  title = "MDAMB231 — Low Den (Sample Hull Overlays)",
+  show_legend = TRUE,
+  outline_col = "#B64249"
+)
+
+p_den10_hull_MDA <- plot_group_hull_overlays(
+  sample_hulls_MDA, "Den10",
+  fixed_limits = c(-300, 300, -300, 300),
+  axis_breaks  = c(-300, -150, 0, 150, 300),
+  title = "MDAMB231 — High Den (Sample Hull Overlays)",
+  show_legend = TRUE,
+  outline_col = "#B64249"
+)
+
+ggsave("ConvexHulls_MDAMB231_Den1_Overlays.png",  p_den1_hull_MDA,  width = 7, height = 6, dpi = 600)
+
+ggsave("ConvexHulls_MDAMB231_Den10_Overlays.png", p_den10_hull_MDA, width = 7, height = 6, dpi = 600)
+
+# Myoep overlays (±600)
+p_den1_hull_Myo <- plot_group_hull_overlays(
+  sample_hulls_Myo, "Den1",
+  fixed_limits = c(-600, 600, -600, 600),
+  axis_breaks  = c(-600, -300, 0, 300, 600),
+  title = "Myoepithelial — Low Den (Sample Hull Overlays)",
+  show_legend = TRUE,
+  outline_col = "#796089"
+)
+
+p_den10_hull_Myo <- plot_group_hull_overlays(
+  sample_hulls_Myo, "Den10",
+  fixed_limits = c(-600, 600, -600, 600),
+  axis_breaks  = c(-600, -300, 0, 300, 600),
+  title = "Myoepithelial — High Den (Sample Hull Overlays)",
+  show_legend = TRUE,
+  outline_col = "#796089"
+)
+
+ggsave("ConvexHulls_Myoepithelial_Den1_Overlays.png",  p_den1_hull_Myo,  width = 7, height = 6, dpi = 600)
+
+ggsave("ConvexHulls_Myoepithelial_Den10_Overlays.png", p_den10_hull_Myo, width = 7, height = 6, dpi = 600)
+
+p_den1_hull_MDA
+p_den10_hull_MDA
+p_den1_hull_Myo
+p_den10_hull_Myo
+```
+
+##### Stats
+```{r}
+SampleHullAreas <- Combined_Positions_Relative %>%
+  dplyr::filter(CellTypeID %in% c("MDAMB231", "Myoepithelial")) %>%
+  dplyr::filter(Group %in% c("Den1", "Den10")) %>%
+  dplyr::group_by(CellTypeID, SampleID, Group) %>%
+  dplyr::summarise(
+    hull_area = {
+      pts <- cbind(RelX, RelY)
+      pts <- pts[stats::complete.cases(pts), , drop = FALSE]
+      if (nrow(pts) < 3) NA_real_ else geometry::convhulln(pts, "FA")$area
+    },
+    .groups = "drop"
+  )
+
+SampleHullAreas
+
+# Raw Welch t-tests 
+stats::t.test(hull_area ~ Group, data = SampleHullAreas %>% dplyr::filter(CellTypeID == "MDAMB231"))
+
+stats::t.test(hull_area ~ Group, data = SampleHullAreas %>% dplyr::filter(CellTypeID == "Myoepithelial"))
+```
+
+```{r}
+t.test(hull_area ~ Group, data = SampleHullAreas %>% filter(CellTypeID == "MDAMB231"))
+
+t.test(hull_area ~ Group, data = SampleHullAreas %>% filter(CellTypeID == "Myoepithelial"))
+```
+
+##### Per sample quant
+```{r}
+star_from_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.0001) return("****")
+  if (p < 0.001)  return("***")
+  if (p < 0.01)   return("**")
+  if (p < 0.05)   return("*")
+  "ns"
+}
+
+plot_hull_area_box <- function(SampleHullAreas, cell_type,
+                               out_png,
+                               title = cell_type,
+                               bracket_y = NULL) {
+
+  df_plot <- SampleHullAreas %>%
+    filter(CellTypeID == cell_type) %>%
+    filter(!is.na(hull_area), is.finite(hull_area), hull_area > 0) %>%
+    mutate(Group = factor(Group, levels = c("Den1", "Den10")))
+
+  # guardrails so t.test doesn't error
+  if (n_distinct(df_plot$Group) < 2 || any(table(df_plot$Group) < 2)) {
+    stop("Not enough samples per group for ", cell_type, " (need both groups and >=2 per group).")
+  }
+
+  tt  <- t.test(hull_area ~ Group, data = df_plot, var.equal = FALSE)
+  sig <- star_from_p(tt$p.value)
+
+  data_max <- max(df_plot$hull_area, na.rm = TRUE)
+  base_y   <- if (!is.null(bracket_y)) bracket_y else data_max * 1.06
+
+  stat_df_hull <- tibble(
+    group1     = "Den1",
+    group2     = "Den10",
+    y.position = base_y,
+    label      = sig
+  ) %>%
+    filter(!is.na(label), label != "ns")
+
+  ylim_top_hull <- if (nrow(stat_df_hull) > 0) {
+    max(stat_df_hull$y.position, na.rm = TRUE) * 1.08
+  } else {
+    data_max * 1.05
+  }
+
+  step       <- if (ylim_top_hull <= 2000) 250 else 500
+  ymax_break <- ceiling(ylim_top_hull / step) * step
+  y_breaks   <- seq(0, ymax_break, by = step)
+
+  p_box <- ggplot(df_plot, aes(x = Group, y = hull_area)) +
+    geom_boxplot(
+      aes(fill = Group),
+      width = 0.55,
+      outlier.shape = NA,
+      alpha = 0.85,
+      linewidth = 0.8
+    ) +
+    geom_jitter(
+      aes(color = Group),
+      width = 0.3,
+      size = 3,
+      alpha = 0.8,
+      show.legend = FALSE
+    ) +
+    scale_x_discrete(labels = c("Den1" = "Low Den", "Den10" = "High Den")) +
+    scale_fill_manual(values = group_colors, drop = FALSE) +
+    scale_color_manual(values = point_colors, drop = FALSE) +
+    scale_y_continuous(breaks = y_breaks, expand = c(0, 0)) +
+    coord_cartesian(ylim = c(0, ylim_top_hull), clip = "off") +
+    {
+      if (nrow(stat_df_hull) > 0) {
+        stat_pvalue_manual(
+          stat_df_hull,
+          xmin = "group1",
+          xmax = "group2",
+          label = "label",
+          y.position = "y.position",
+          tip.length = 0.03,
+          size = 14,
+          bracket.size = 0.9
+        )
+      } else NULL
+    } +
+    labs(
+      title = title,
+      x = "Cancer Density",
+      y = expression("Migration Territory ("*mu*m^2*")")
+    ) +
+    theme_classic(base_size = 22) +
+    theme(
+      axis.line    = element_line(linewidth = 0.8, color = "black"),
+      axis.text.y  = element_text(size = 18),
+      axis.title.y = element_text(size = 20),
+      axis.text.x  = element_text(size = 18, hjust = 0.5),
+      axis.title.x = element_text(size = 20),
+      plot.title   = element_text(size = 18, hjust = 0.5),
+      legend.position = "none",
+      plot.margin = margin(10, 10, 10, 10)
+    )
+
+  ggsave(out_png, p_box, width = 4.5, height = 6, dpi = 600)
+  p_box
+}
+
+# Make both plots
+p_box_MDA <- plot_hull_area_box(
+  SampleHullAreas, "MDAMB231",
+  out_png = "HullArea_MDAMB231_D1vD10.png",
+  title   = "MDAMB231"
+)
+
+p_box_Myo <- plot_hull_area_box(
+  SampleHullAreas, "Myoepithelial",
+  out_png = "HullArea_Myoepithelial_D1vD10.png",
+  title   = "Myoepithelial"
+)
+
+p_box_MDA
+p_box_Myo
+```
+
+### 3.) Total Distance Traveled
+```{r}
+CP_num_len <- Combined_Positions %>%
+  mutate(
+    TimeNum = as.integer(Time),
+    X       = as.numeric(X_Position),
+    Y       = as.numeric(Y_Position)
+  ) %>%
+  arrange(SampleID, UniqueID, TimeNum)
+
+# Track length per track (UniqueID)
+TrackLengths <- CP_num_len %>%
+  group_by(SampleID, UniqueID, Group, CellTypeID) %>%
+  summarise(
+    TrackLength = {
+      x <- X
+      y <- Y
+      ok <- complete.cases(x, y)
+      x <- x[ok]; y <- y[ok]
+      if (length(x) < 2) {
+        NA_real_
+      } else {
+        sum(sqrt(diff(x)^2 + diff(y)^2))
+      }
+    },
+    n_points = sum(complete.cases(X, Y)),
+    .groups = "drop"
+  )
+
+df_len <- TrackLengths %>%
+  filter(
+    CellTypeID %in% c("MDAMB231", "Myoepithelial"),
+    Group %in% c("Den1", "Den10"),
+    !is.na(TrackLength),
+    is.finite(TrackLength)
+  ) %>%
+  mutate(
+    Group      = factor(Group, levels = c("Den1", "Den10")),
+    CellTypeID = factor(CellTypeID, levels = c("MDAMB231", "Myoepithelial"))
+  )
+
+# Welch t-tests (per cell type)
+star_from_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.0001) return("****")
+  if (p < 0.001)  return("***")
+  if (p < 0.01)   return("**")
+  if (p < 0.05)   return("*")
+  "ns"
+}
+
+welch_tracklength_by_celltype <- function(df) {
+
+  res <- df %>%
+    group_by(CellTypeID) %>%
+    group_modify(function(d, key) {
+
+      d <- d %>%
+        tidyr::drop_na(TrackLength, Group) %>%
+        mutate(Group = factor(Group, levels = c("Den1", "Den10")))
+
+      # require both groups + >=2 tracks per group
+      if (n_distinct(d$Group) < 2 || any(table(d$Group) < 2)) {
+        return(tibble(
+          comparison = "Den1-Den10",
+          direction  = NA_character_,
+          p_value    = NA_real_,
+          sig        = NA_character_,
+          statement  = paste0(as.character(key$CellTypeID), ": Not enough tracks in one group")
+        ))
+      }
+
+      tt <- t.test(TrackLength ~ Group, data = d, var.equal = FALSE)
+      p  <- tt$p.value
+
+      means <- tapply(d$TrackLength, d$Group, mean, na.rm = TRUE)
+      dir_txt <- if (means["Den1"] > means["Den10"]) "Den1 > Den10" else "Den10 > Den1"
+
+      tibble(
+        comparison = "Den1-Den10",
+        direction  = dir_txt,
+        p_value    = p,
+        sig        = star_from_p(p),
+        statement  = paste0(
+          as.character(key$CellTypeID),
+          " TrackLength: ", dir_txt,
+          " (Welch t-test, p = ", signif(p, 3), ", ", star_from_p(p), ")"
+        )
+      )
+    }) %>%
+    ungroup()
+
+  res
+}
+
+tracklen_pairwise <- welch_tracklength_by_celltype(df_len)
+```
+
+#### Stats
+```{r}
+tracklen_pairwise
+tracklen_pairwise$statement
+```
+
+#### Viz
+```{r}
+fill_cols <- group_colors
+point_cols <- fill_cols  #do this so we can set the alpha different
+
+ymax <- max(df_len$TrackLength, na.rm = TRUE)
+ymax_ceil <- ceiling(ymax / 250) * 250
+step <- if (ymax_ceil <= 2000) 250 else 500
+y_breaks <- seq(0, ymax_ceil, by = step)
+
+sig_rows <- tracklen_pairwise %>%
+  filter(!is.na(sig), sig != "ns") %>%
+  mutate(
+    group1 = "Den1",
+    group2 = "Den10"
+  )
+
+# bracket heights per facet
+base_y <- ymax_ceil * 0.80
+step_y <- ymax_ceil * 0.08
+
+stat_df_len <- sig_rows %>%
+  group_by(CellTypeID) %>%
+  mutate(
+    y.position = base_y + step_y * (row_number() - 1),
+    label      = sig
+  ) %>%
+  ungroup() %>%
+  select(CellTypeID, group1, group2, y.position, label)
+
+ylim_top_len <- if (nrow(stat_df_len) > 0) {
+  max(stat_df_len$y.position, na.rm = TRUE) * 1.10
+} else {
+  ymax_ceil * 1.10
+}
+
+p_len <- ggplot(df_len, aes(x = Group, y = TrackLength)) +
+  geom_violin(
+    aes(fill = Group),
+    trim  = FALSE,
+    alpha = 0.35,
+    color = NA,
+    width = 0.95
+  ) +
+  geom_boxplot(
+    aes(fill = Group),
+    width         = 0.22,
+    outlier.shape = NA,
+    alpha         = 0.85,
+    linewidth     = 0.8
+  ) +
+  geom_jitter(
+    aes(color = Group),
+    width = 0.15,
+    size  = 2,
+    alpha = 0.55,
+    show.legend = FALSE
+  ) +
+  facet_grid(. ~ CellTypeID) +
+  scale_fill_manual(values = fill_cols, drop = FALSE) +
+  scale_color_manual(values = point_cols, drop = FALSE) +
+  scale_y_continuous(breaks = y_breaks, expand = c(0, 0)) +
+  scale_x_discrete(labels = c("Den1" = "Low Den", "Den10" = "High Den")) +
+  coord_cartesian(ylim = c(0, ylim_top_len)) +
+  {
+    if (nrow(stat_df_len) > 0) {
+      stat_pvalue_manual(
+        stat_df_len,
+        xmin = "group1",
+        xmax = "group2",
+        label = "label",
+        y.position = "y.position",
+        tip.length   = 0.03,
+        size         = 6,
+        bracket.size = 0.9
+      )
+    } else {
+      NULL
+    }
+  } +
+  labs(
+    title = NULL,
+    x     = "Cancer Density",
+    y     = expression("Total Distance Traveled ("*mu*"m)")
+  ) +
+  theme_classic(base_size = 20) +
+  theme(
+    axis.line    = element_line(linewidth = 0.9, color = "black"),
+    axis.text.y  = element_text(size = 18),
+    axis.title.y = element_text(size = 20),
+    axis.text.x  = element_text(size = 16, angle = 0, hjust = 0.5),
+    axis.title.x = element_text(size = 16),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text.x = element_text(size = 20),
+    panel.spacing.x = unit(2, "lines")
+  )
+
+ggsave(
+  filename = "TrackLength_ViolinBox_StarsOnly_Den1_Den10.png",
+  plot     = p_len,
+  width    = 6.5,
+  height   = 4.7,
+  dpi      = 600
+)
+
+p_len
+```
+
+
+### 4.) Normalized Distance (Distance ÷ Frames) Accounts for tracks truncated from cell divisions and cells that go out of frame.
+```{r}
+CP_num_df <- Combined_Positions %>%
+  mutate(
+    TimeNum = suppressWarnings(as.integer(Time)),
+    X       = suppressWarnings(as.numeric(X_Position)),
+    Y       = suppressWarnings(as.numeric(Y_Position))
+  ) %>%
+  arrange(SampleID, UniqueID, TimeNum)
+
+DistPerFrame_df <- CP_num_df %>%
+  filter(CellTypeID %in% c("MDAMB231", "Myoepithelial")) %>%
+  group_by(SampleID, UniqueID, Group, CellTypeID) %>%
+  summarise(
+    n_frames_visible = n_distinct(TimeNum[complete.cases(X, Y)]),
+
+    TrackLength = {
+      d <- data.frame(TimeNum = TimeNum, X = X, Y = Y) %>%
+        filter(complete.cases(TimeNum, X, Y)) %>%
+        arrange(TimeNum)
+
+      if (nrow(d) < 2) NA_real_ else sum(sqrt(diff(d$X)^2 + diff(d$Y)^2))
+    },
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(TrackLength), n_frames_visible >= 2) %>%
+  mutate(
+    Group = factor(Group, levels = c("Den1", "Den10")),
+    CellTypeID = factor(CellTypeID, levels = c("MDAMB231", "Myoepithelial")),
+    Dist_um_per_frame = TrackLength / (n_frames_visible - 1)
+  )
+
+df_dist_frame <- DistPerFrame_df
+```
+
+#### Stats
+```{r}
+# Welch t-test per cell type
+star_from_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.0001) return("****")
+  if (p < 0.001)  return("***")
+  if (p < 0.01)   return("**")
+  if (p < 0.05)   return("*")
+  "ns"
+}
+
+pairwise_dist_frame_den <- function(df) {
+
+  df %>%
+    group_by(CellTypeID) %>%
+    group_modify(function(d, key) {
+
+      d <- d %>%
+        tidyr::drop_na(Dist_um_per_frame, Group) %>%
+        mutate(Group = factor(Group, levels = c("Den1", "Den10")))
+
+      # require both groups + >=2 tracks per group
+      if (n_distinct(d$Group) < 2 || any(table(d$Group) < 2)) {
+        return(tibble(
+          comparison = "Den1-Den10",
+          direction  = NA_character_,
+          p_value    = NA_real_,
+          sig        = NA_character_,
+          statement  = paste0(as.character(key$CellTypeID), ": Not enough tracks in one group")
+        ))
+      }
+
+      tt <- t.test(Dist_um_per_frame ~ Group, data = d, var.equal = FALSE)
+      p  <- tt$p.value
+
+      means <- tapply(d$Dist_um_per_frame, d$Group, mean, na.rm = TRUE)
+      dir_txt <- if (means["Den1"] > means["Den10"]) "Den1 > Den10" else "Den10 > Den1"
+
+      tibble(
+        comparison = "Den1-Den10",
+        direction  = dir_txt,
+        p_value    = p,
+        sig        = star_from_p(p),
+        statement  = paste0(
+          as.character(key$CellTypeID),
+          " Distance/frame: ", dir_txt,
+          " (Welch t-test, p = ", signif(p, 3), ", ", star_from_p(p), ")"
+        )
+      )
+    }) %>%
+    ungroup()
+}
+
+dist_frame_pairwise <- pairwise_dist_frame_den(df_dist_frame)
+
+dist_frame_pairwise
+dist_frame_pairwise$statement
+```
+
+#### Viz
+```{r}
+fill_cols  <- group_colors
+point_cols <- point_colors
+
+sig_rows <- dist_frame_pairwise %>%
+  filter(!is.na(sig), sig != "ns") %>%
+  mutate(group1 = "Den1", group2 = "Den10")
+
+if (nrow(df_dist_frame) == 0) {
+  stop("df_dist_frame is empty. Check Group assignment + CellTypeID filtering upstream.")
+}
+
+data_max <- max(df_dist_frame$Dist_um_per_frame, na.rm = TRUE)
+if (!is.finite(data_max)) {
+  stop("Dist_um_per_frame is all NA or non-finite. Check numeric conversion of X/Y/Time.")
+}
+
+# bracket heights per facet
+base_y <- data_max * 1.2
+step_y <- data_max * 0.08
+
+stat_df_dist <- sig_rows %>%
+  group_by(CellTypeID) %>%
+  mutate(
+    y.position = base_y + step_y * (row_number() - 1),
+    label      = sig
+  ) %>%
+  ungroup() %>%
+  select(CellTypeID, group1, group2, y.position, label)
+
+ylim_top_dist <- if (nrow(stat_df_dist) > 0) {
+  max(stat_df_dist$y.position, na.rm = TRUE) * 1.10
+} else {
+  data_max * 1.20
+}
+
+# y breaks
+step <- if (ylim_top_dist <= 10) 1 else if (ylim_top_dist <= 25) 2.5 else 5
+ymax_break <- ceiling(ylim_top_dist / step) * step
+y_breaks <- seq(0, ymax_break, by = step)
+
+p_dist_frame <- ggplot(df_dist_frame, aes(x = Group, y = Dist_um_per_frame)) +
+  geom_violin(aes(fill = Group), trim = FALSE, alpha = 0.35, color = NA, width = 0.95) +
+  geom_boxplot(aes(fill = Group), width = 0.22, outlier.shape = NA, alpha = 0.85, linewidth = 0.8) +
+  geom_jitter(aes(color = Group), width = 0.15, size = 2, alpha = 0.55, show.legend = FALSE) +
+  facet_grid(. ~ CellTypeID) +
+  scale_fill_manual(values = fill_cols, drop = FALSE) +
+  scale_color_manual(values = point_cols, drop = FALSE) +
+  scale_y_continuous(breaks = y_breaks, expand = c(0, 0)) +
+  scale_x_discrete(labels = c("Den1" = "Low Den", "Den10" = "High Den")) +
+  coord_cartesian(ylim = c(0, ylim_top_dist)) +
+  {
+    if (nrow(stat_df_dist) > 0) {
+      stat_pvalue_manual(
+        stat_df_dist,
+        xmin = "group1",
+        xmax = "group2",
+        label = "label",
+        y.position = "y.position",
+        tip.length = 0.03,
+        size = 14,
+        bracket.size = 0.9
+      )
+    } else NULL
+  } +
+  labs(
+    title = NULL,
+    x     = "Cancer Density",
+    y     = "Normalized Distance \nTraveled (µm / Frame)"
+  ) +
+  theme_classic(base_size = 20) +
+  theme(
+    axis.line    = element_line(linewidth = 0.9, color = "black"),
+    axis.text.y  = element_text(size = 18),
+    axis.title.y = element_text(size = 20, angle = 90, vjust = 0.45),
+    axis.text.x  = element_text(size = 16, hjust = 0.5),
+    axis.title.x = element_text(size = 16),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text.x = element_text(size = 20),
+    panel.spacing.x = unit(2, "lines"),
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 28, unit = "pt")
+  )
+
+ggsave(
+  filename = "DistancePerVisibleFrame_ViolinBox_StarsOnly_Den1_Den10.png",
+  plot     = p_dist_frame,
+  width    = 6.5,
+  height   = 5,
+  dpi      = 600
+)
+
+p_dist_frame
+```
+
+### 5.) Net Displacement
+```{r}
+fill_cols  <- group_colors
+point_cols <- point_colors
+
+# Build per-track net displacement
+disp_df <- Combined_Positions %>%
+  mutate(
+    TimeNum = as.integer(Time),
+    X       = as.numeric(X_Position),
+    Y       = as.numeric(Y_Position)
+  ) %>%
+  filter(
+    is.finite(TimeNum), is.finite(X), is.finite(Y),
+    Group %in% c("Den1", "Den10"),
+    CellTypeID %in% c("MDAMB231", "Myoepithelial"),
+    CellTypeID != "Missing_ID"
+  ) %>%
+  arrange(SampleID, UniqueID, TimeNum) %>%
+  group_by(SampleID, UniqueID) %>%
+  summarise(
+    Group      = first(Group),
+    CellTypeID = first(CellTypeID),
+
+    # sanity checks (drop broken tracks)
+    group_n    = n_distinct(Group),
+    celltype_n = n_distinct(CellTypeID),
+
+    x0 = first(X),
+    y0 = first(Y),
+    x1 = last(X),
+    y1 = last(Y),
+
+    Displacement_um = sqrt((x1 - x0)^2 + (y1 - y0)^2),
+    n_points = n(),
+    .groups = "drop"
+  ) %>%
+  filter(group_n == 1, celltype_n == 1, n_points >= 2) %>%
+  select(-group_n, -celltype_n) %>%
+  mutate(
+    Group      = factor(Group, levels = c("Den1", "Den10")),
+    CellTypeID = factor(CellTypeID, levels = c("MDAMB231", "Myoepithelial"))
+  )
+
+# optional count check
+disp_df %>% count(CellTypeID, Group)
+```
+
+#### Stats
+```{r}
+# Welch t-test per cell type
+star_from_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.0001) return("****")
+  if (p < 0.001)  return("***")
+  if (p < 0.01)   return("**")
+  if (p < 0.05)   return("*")
+  "ns"
+}
+
+welch_displacement_by_celltype <- function(df) {
+
+  df %>%
+    group_by(CellTypeID) %>%
+    group_modify(function(d, key) {
+
+      d <- d %>%
+        tidyr::drop_na(Displacement_um, Group) %>%
+        mutate(Group = factor(Group, levels = c("Den1", "Den10")))
+
+      # require both groups + >=2 tracks per group
+      if (n_distinct(d$Group) < 2 || any(table(d$Group) < 2)) {
+        return(tibble(
+          comparison = "Den1-Den10",
+          direction  = NA_character_,
+          p_value    = NA_real_,
+          sig        = NA_character_,
+          statement  = paste0(as.character(key$CellTypeID), ": Not enough tracks in one group")
+        ))
+      }
+
+      tt <- t.test(Displacement_um ~ Group, data = d, var.equal = FALSE)
+      p  <- tt$p.value
+
+      means <- tapply(d$Displacement_um, d$Group, mean, na.rm = TRUE)
+      dir_txt <- if (means["Den1"] > means["Den10"]) "Den1 > Den10" else "Den10 > Den1"
+
+      tibble(
+        comparison = "Den1-Den10",
+        direction  = dir_txt,
+        p_value    = p,
+        sig        = star_from_p(p),
+        statement  = paste0(
+          as.character(key$CellTypeID),
+          " Net Displacement: ", dir_txt,
+          " (Welch t-test, p = ", signif(p, 3), ", ", star_from_p(p), ")"
+        )
+      )
+    }) %>%
+    ungroup()
+}
+
+disp_pairwise <- welch_displacement_by_celltype(disp_df)
+
+disp_pairwise
+disp_pairwise$statement
+```
+
+#### Viz
+```{r}
+# Viz (violin + box + jitter; stars only; faceted by cell type)
+
+sig_rows <- disp_pairwise %>%
+  filter(!is.na(sig), sig != "ns") %>%
+  mutate(group1 = "Den1", group2 = "Den10")
+
+if (nrow(disp_df) == 0) {
+  stop("disp_df is empty. Check Group + CellTypeID filtering upstream.")
+}
+
+data_max <- max(disp_df$Displacement_um, na.rm = TRUE)
+if (!is.finite(data_max)) {
+  stop("Displacement_um is all NA or non-finite.")
+}
+
+# "nice" step sizes for displacement
+step <- if (data_max <= 500) 50 else if (data_max <= 1000) 100 else if (data_max <= 2000) 250 else 500
+ymax_ceil <- ceiling(data_max / step) * step
+
+# bracket heights per facet
+base_y <- ymax_ceil * 0.80
+step_y <- ymax_ceil * 0.08
+
+stat_df_disp <- sig_rows %>%
+  group_by(CellTypeID) %>%
+  mutate(
+    y.position = base_y + step_y * (row_number() - 1),
+    label      = sig
+  ) %>%
+  ungroup() %>%
+  select(CellTypeID, group1, group2, y.position, label)
+
+ylim_top_disp <- if (nrow(stat_df_disp) > 0) {
+  max(stat_df_disp$y.position, na.rm = TRUE) * 1.10
+} else {
+  ymax_ceil * 1.10
+}
+
+# extend breaks to top
+ymax_break <- ceiling(ylim_top_disp / step) * step
+y_breaks   <- seq(0, ymax_break, by = step)
+
+p_disp <- ggplot(disp_df, aes(x = Group, y = Displacement_um)) +
+  geom_violin(aes(fill = Group), trim = FALSE, alpha = 0.35, color = NA, width = 0.95) +
+  geom_boxplot(aes(fill = Group), width = 0.22, outlier.shape = NA, alpha = 0.85, linewidth = 0.8) +
+  geom_jitter(aes(color = Group), width = 0.15, size = 2, alpha = 0.55, show.legend = FALSE) +
+  facet_grid(. ~ CellTypeID) +
+  scale_fill_manual(values = fill_cols, drop = FALSE) +
+  scale_color_manual(values = point_cols, drop = FALSE) +
+  scale_y_continuous(breaks = y_breaks, expand = c(0, 0)) +
+  scale_x_discrete(labels = c("Den1" = "Low Den", "Den10" = "High Den")) +
+  coord_cartesian(ylim = c(0, ylim_top_disp)) +
+  {
+    if (nrow(stat_df_disp) > 0) {
+      ggpubr::stat_pvalue_manual(
+        stat_df_disp,
+        xmin = "group1",
+        xmax = "group2",
+        label = "label",
+        y.position = "y.position",
+        tip.length   = 0.03,
+        size         = 6,
+        bracket.size = 0.9
+      )
+    } else NULL
+  } +
+  labs(
+    title = NULL,
+    x = "Cancer Density",
+    y = expression("Net Displacement ("*mu*m*")")
+  ) +
+  theme_classic(base_size = 20) +
+  theme(
+    axis.line    = element_line(linewidth = 0.9, color = "black"),
+    axis.text.y  = element_text(size = 18),
+    axis.title.y = element_text(size = 20),
+    axis.text.x  = element_text(size = 16, hjust = 0.5),
+    axis.title.x = element_text(size = 16),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text.x = element_text(size = 20),
+    panel.spacing.x = unit(2, "lines")
+  )
+
+ggsave(
+  filename = "NetDisplacement_ViolinBox_StarsOnly_Den1_Den10.png",
+  plot     = p_disp,
+  width    = 6.5,
+  height   = 4.7,
+  dpi      = 600
+)
+
+p_disp
+```
+
+
+### 6.) MSD
+```{r}
+frame_interval_min <- 10
+
+prep_tracks <- function(df) {
+  df %>%
+    mutate(
+      Time       = suppressWarnings(readr::parse_number(as.character(Time))),
+      X_Position = suppressWarnings(readr::parse_number(as.character(X_Position))),
+      Y_Position = suppressWarnings(readr::parse_number(as.character(Y_Position)))
+    ) %>%
+    filter(is.finite(Time), is.finite(X_Position), is.finite(Y_Position)) %>%
+    arrange(UniqueID, Time) %>%
+    distinct(UniqueID, Time, .keep_all = TRUE)
+}
+
+tasd_per_track <- function(track_df) {
+  x <- track_df$X_Position
+  y <- track_df$Y_Position
+  n <- length(x)
+  if (n < 2) return(tibble::tibble(tau_frames = integer(), msd_track = numeric()))
+
+  k_vec <- seq_len(n - 1)
+  msd_k <- vapply(k_vec, function(k) {
+    dx <- x[(1 + k):n] - x[1:(n - k)]
+    dy <- y[(1 + k):n] - y[1:(n - k)]
+    mean(dx*dx + dy*dy, na.rm = TRUE)
+  }, numeric(1))
+
+  tibble::tibble(tau_frames = k_vec, msd_track = msd_k)
+}
+
+calc_tasd_unbalanced <- function(df, frame_interval_min = 10, min_tracks_for_sem = 3) {
+  df <- df %>%
+    prep_tracks() %>%
+    group_by(UniqueID) %>%
+    arrange(Time, .by_group = TRUE)
+
+  if (nrow(df) == 0) {
+    return(tibble::tibble(
+      tau_frames = integer(),
+      tau_min    = numeric(),
+      tasd       = numeric(),
+      sem        = numeric(),
+      n_tracks   = integer()
+    ))
+  }
+
+  per_track <- df %>%
+    group_split(UniqueID, .keep = FALSE) %>%
+    purrr::map_dfr(tasd_per_track, .id = "track_index")
+
+  per_track %>%
+    group_by(tau_frames) %>%
+    summarise(
+      tasd     = mean(msd_track, na.rm = TRUE),
+      sem      = sd(msd_track, na.rm = TRUE) / sqrt(sum(is.finite(msd_track))),
+      n_tracks = sum(is.finite(msd_track)),
+      .groups  = "drop"
+    ) %>%
+    mutate(
+      tau_min = tau_frames * frame_interval_min,
+      tau_hr  = tau_min / 60,                          # <<< NEW: hours
+      sem     = ifelse(n_tracks >= min_tracks_for_sem, sem, NA_real_)
+    ) %>%
+    arrange(tau_frames)
+}
+
+compute_by_celltype <- function(dat,
+                                celltype,
+                                groups = c("Den1","Den10"),
+                                frame_interval_min = 10,
+                                min_tracks_for_sem = 3) {
+  purrr::map_dfr(groups, function(g) {
+    subset_df <- dat %>%
+      filter(CellTypeID == celltype, Group == g) %>%
+      select(UniqueID, Time, X_Position, Y_Position)
+
+    out <- calc_tasd_unbalanced(
+      subset_df,
+      frame_interval_min = frame_interval_min,
+      min_tracks_for_sem = min_tracks_for_sem
+    )
+    out$Group      <- g
+    out$CellTypeID <- celltype
+    out
+  })
+}
+
+trim_to_common_tau <- function(summary_df, groups = c("Den1","Den10")) {
+  df <- summary_df %>% filter(Group %in% groups)
+
+  max_tau_by_group <- df %>%
+    group_by(CellTypeID, Group) %>%
+    summarise(
+      max_tau = max(tau_frames[n_tracks >= 1], na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  common_tau_by_ct <- max_tau_by_group %>%
+    group_by(CellTypeID) %>%
+    summarise(common_tau = min(max_tau, na.rm = TRUE), .groups = "drop")
+
+  df %>%
+    left_join(common_tau_by_ct, by = "CellTypeID") %>%
+    filter(is.finite(common_tau), tau_frames <= common_tau) %>%
+    select(-common_tau)
+}
+
+# Compute summaries
+mda_sum <- compute_by_celltype(
+  Combined_Positions,
+  celltype = "MDAMB231",
+  groups = c("Den1","Den10"),
+  frame_interval_min = frame_interval_min,
+  min_tracks_for_sem = 3
+)
+
+myo_sum <- compute_by_celltype(
+  Combined_Positions,
+  celltype = "Myoepithelial",
+  groups = c("Den1","Den10"),
+  frame_interval_min = frame_interval_min,
+  min_tracks_for_sem = 3
+)
+
+all_sum <- bind_rows(mda_sum, myo_sum) %>%
+  mutate(
+    Group      = factor(Group, levels = c("Den1","Den10")),
+    CellTypeID = factor(CellTypeID, levels = c("MDAMB231","Myoepithelial"))
+  )
+
+# Trim to common tau per cell type so Den1 and Den10 have identical x-range within each facet
+all_sum_trim <- trim_to_common_tau(all_sum, groups = c("Den1","Den10"))
+
+# y-limit based on observed (tasd + sem)
+y_max <- max(all_sum_trim$tasd + ifelse(is.finite(all_sum_trim$sem), all_sum_trim$sem, 0), na.rm = TRUE)
+y_max <- ceiling(y_max / 1000) * 1000
+
+# Ribbon only where SEM exists
+all_ribbon <- all_sum_trim %>% filter(is.finite(sem))
+
+xmax_hr <- max(all_sum_trim$tau_hr, na.rm = TRUE)
+x_breaks_hr <- seq(0, ceiling(xmax_hr / 6) * 6, by = 6)
+
+all_sum <- bind_rows(mda_sum, myo_sum) %>%
+  mutate(
+    Group = factor(
+      Group,
+      levels = c("Den1", "Den10"),
+      labels = c("Low Den", "High Den")
+    ),
+    CellTypeID = factor(CellTypeID, levels = c("MDAMB231","Myoepithelial"))
+  )
+
+p_tasd <- ggplot(all_sum_trim, aes(x = tau_hr, y = tasd, color = Group, fill = Group)) +
+  geom_ribbon(
+    data = all_ribbon,
+    aes(ymin = pmax(tasd - sem, 0), ymax = tasd + sem),
+    alpha = 0.18,
+    color = NA
+  ) +
+  geom_line(linewidth = 0.9, na.rm = TRUE) +
+  geom_point(size = 0.5, alpha = 0.6, na.rm = TRUE) +
+  facet_grid(. ~ CellTypeID) +
+  scale_color_manual(
+  values = group_colors,
+  breaks = c("Den1", "Den10"),
+  labels = c("Low Den", "High Den"),
+  name   = "Cancer \nDensity",
+  drop   = FALSE
+) +
+scale_fill_manual(
+  values = group_colors,
+  breaks = c("Den1", "Den10"),
+  labels = c("Low Den", "High Den"),
+  name   = "Cancer \nDensity",
+  drop   = FALSE
+) +
+  scale_x_continuous(
+    limits = c(0, NA),
+    breaks = x_breaks_hr,
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(limits = c(0, y_max), expand = expansion(mult = c(0, 0.02))) +
+  labs(
+    title = NULL,
+    x = "Lag τ (hours)",
+    y = expression("MSD ("*µ*m^2*")")
+  ) +
+  theme_classic(base_size = 22) +
+  theme(
+    plot.title       = element_text(size = 24),
+    legend.position  = "right",
+    legend.title = element_text(size = 18, margin = margin(b = 4)),
+    legend.text = element_text(size = 16),
+    legend.key.height = unit(10, "pt"),
+    legend.spacing.y  = unit(2, "pt"),
+    strip.background = element_blank(),
+    strip.text.x     = element_text(size = 20),
+    axis.line        = element_line(linewidth = 1.1, color = "black"),
+    axis.text        = element_text(size = 18),
+    axis.title       = element_text(size = 20),
+    panel.spacing.x  = grid::unit(2, "cm")
+  )
+
+
+ggsave("TASD_Den1_Den10_MDAMB231_Myo_sharedY.png", 
+       p_tasd, 
+       width = 12.5, 
+       height = 6, 
+       dpi = 600)
+
+p_tasd
+```
+
+#### Alpha calculation
+```{r}
+fit_range_hr <- c(0.83, 8.33)   # 50 to 500 minutes expressed in hours
+
+get_alpha <- function(df,
+                      tau_col = "tau_hr",         
+                      msd_col = "tasd",
+                      tau_range = c(0.83, 8.33),
+                      min_pts = 3) {
+
+  stopifnot(tau_col %in% names(df), msd_col %in% names(df))
+
+  df_filt <- df %>%
+    dplyr::filter(
+      is.finite(.data[[tau_col]]),
+      .data[[tau_col]] >= tau_range[1],
+      .data[[tau_col]] <= tau_range[2],
+      is.finite(.data[[msd_col]]),
+      .data[[msd_col]] > 0
+    ) %>%
+    dplyr::mutate(
+      log_tau = log(.data[[tau_col]]),
+      log_msd = log(.data[[msd_col]])
+    )
+
+  if (nrow(df_filt) == 0) {
+    return(tibble::tibble(
+      CellTypeID = character(),
+      Group      = character(),
+      n_pts      = integer(),
+      alpha      = numeric(),
+      r2         = numeric()
+    ))
+  }
+
+  df_filt %>%
+    dplyr::group_by(CellTypeID, Group) %>%
+    tidyr::nest() %>%
+    dplyr::mutate(
+      n_pts  = purrr::map_int(data, nrow),
+      model = purrr::map(data, ~ if (nrow(.x) >= min_pts) stats::lm(log_msd ~ log_tau, data = .x) else NULL),
+      alpha = purrr::map_dbl(model, ~ if (is.null(.x)) NA_real_ else unname(stats::coef(.x)[2])),
+      r2    = purrr::map_dbl(model, ~ if (is.null(.x)) NA_real_ else summary(.x)$r.squared)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(CellTypeID, Group, n_pts, alpha, r2)
+}
+
+alpha_results <- get_alpha(
+  all_sum_trim,
+  tau_col   = "tau_hr",
+  msd_col   = "tasd",
+  tau_range = fit_range_hr,
+  min_pts   = 3
+)
+
+alpha_results %>%
+  dplyr::mutate(alpha = sprintf("%.2f", alpha))
+```
+
+## All not sig
+
+### 7.) Travel Consistency
+```{r}
+if (!exists("TrackLengths")) {
+  CP_num_len <- Combined_Positions %>%
+    mutate(
+      TimeNum = as.integer(Time),
+      X       = as.numeric(X_Position),
+      Y       = as.numeric(Y_Position)
+    ) %>%
+    arrange(SampleID, UniqueID, TimeNum)
+  
+  TrackLengths <- CP_num_len %>%
+    group_by(SampleID, UniqueID, Group, CellTypeID) %>%
+    summarise(
+      TrackLength = {
+        x <- X; y <- Y
+        ok <- complete.cases(x, y)
+        x <- x[ok]; y <- y[ok]
+        if (length(x) < 2) NA_real_ else sum(sqrt(diff(x)^2 + diff(y)^2))
+      },
+      n_points = sum(complete.cases(X, Y)),
+      .groups = "drop"
+    )
+}
+
+if (!exists("disp_df")) {
+  disp_df <- Combined_Positions %>%
+    mutate(
+      TimeNum = as.integer(Time),
+      X       = as.numeric(X_Position),
+      Y       = as.numeric(Y_Position)
+    ) %>%
+    filter(
+      is.finite(TimeNum), is.finite(X), is.finite(Y),
+      Group %in% c("Den1", "Den10"),
+      CellTypeID %in% c("MDAMB231", "Myoepithelial"),
+      CellTypeID != "Missing_ID"
+    ) %>%
+    arrange(SampleID, UniqueID, TimeNum) %>%
+    group_by(SampleID, UniqueID) %>%
+    summarise(
+      Group      = first(Group),
+      CellTypeID = first(CellTypeID),
+      group_n    = n_distinct(Group),
+      celltype_n = n_distinct(CellTypeID),
+      x0 = first(X), y0 = first(Y),
+      x1 = last(X),  y1 = last(Y),
+      Displacement_um = sqrt((x1 - x0)^2 + (y1 - y0)^2),
+      n_points = n(),
+      .groups = "drop"
+    ) %>%
+    filter(group_n == 1, celltype_n == 1, n_points >= 2) %>%
+    select(-group_n, -celltype_n) %>%
+    mutate(
+      Group      = factor(Group, levels = c("Den1", "Den10")),
+      CellTypeID = factor(CellTypeID, levels = c("MDAMB231", "Myoepithelial"))
+    )
+}
+
+# Merge + compute CI
+CI_df <- TrackLengths %>%
+  inner_join(
+    disp_df %>% select(SampleID, UniqueID, Group, CellTypeID, Displacement_um),
+    by = c("SampleID", "UniqueID", "Group", "CellTypeID")
+  ) %>%
+  mutate(
+    TrackLength     = as.numeric(TrackLength),
+    Displacement_um = as.numeric(Displacement_um),
+    CI = if_else(
+      is.finite(TrackLength) & TrackLength > 0 & is.finite(Displacement_um) & Displacement_um >= 0,
+      Displacement_um / TrackLength,
+      NA_real_
+    )
+  ) %>%
+  filter(
+    Group %in% c("Den1", "Den10"),
+    CellTypeID %in% c("MDAMB231", "Myoepithelial"),
+    is.finite(CI)
+  ) %>%
+  mutate(
+    Group      = factor(Group, levels = c("Den1", "Den10")),
+    CellTypeID = factor(CellTypeID, levels = c("MDAMB231", "Myoepithelial"))
+  )
+```
+
+#### Stats
+```{r}
+pairwise_ci_den <- function(df) {
+
+  star_from_p <- function(p) {
+    if (is.na(p)) return(NA_character_)
+    if (p <= 0.0001) return("****")
+    if (p <= 0.001)  return("***")
+    if (p <= 0.01)   return("**")
+    if (p <= 0.05)   return("*")
+    "ns"
+  }
+
+  df %>%
+    group_by(CellTypeID) %>%
+    group_modify(function(d, key) {
+
+      d <- d %>%
+        tidyr::drop_na(CI, Group) %>%
+        mutate(Group = factor(Group, levels = c("Den1", "Den10")))
+
+      # require both groups + >=2 tracks per group
+      if (n_distinct(d$Group) < 2 || any(table(d$Group) < 2)) {
+        return(tibble(
+          comparison = "Den1-Den10",
+          direction  = NA_character_,
+          p_value    = NA_real_,
+          sig        = NA_character_,
+          statement  = paste0(as.character(key$CellTypeID), ": Not enough tracks in one group")
+        ))
+      }
+
+      tt <- t.test(CI ~ Group, data = d, var.equal = FALSE)
+      p  <- tt$p.value
+
+      means <- tapply(d$CI, d$Group, mean, na.rm = TRUE)
+      dir_txt <- if (means["Den1"] > means["Den10"]) "Den1 > Den10" else "Den10 > Den1"
+
+      tibble(
+        comparison = "Den1-Den10",
+        direction  = dir_txt,
+        p_value    = p,
+        sig        = star_from_p(p),
+        statement  = paste0(
+          as.character(key$CellTypeID),
+          " Travel Consistency: ", dir_txt,
+          " (Welch t-test, p = ", signif(p, 3), ", ", star_from_p(p), ")"
+        )
+      )
+    }) %>%
+    ungroup()
+}
+
+ci_pairwise <- pairwise_ci_den(CI_df)
+ci_pairwise
+ci_pairwise$statement
+```
+
+#### Viz
+```{r}
+fill_cols  <- group_colors
+point_cols <- point_colors
+
+sig_rows <- ci_pairwise %>%
+  filter(!is.na(sig), sig != "ns") %>%
+  mutate(group1 = "Den1", group2 = "Den10")
+
+data_max <- max(CI_df$CI, na.rm = TRUE)
+if (!is.finite(data_max)) stop("CI is all NA/non-finite. Check TrackLength + displacement calculations.")
+
+# CI should be in [0, 1] but give headroom for brackets
+base_y <- min(0.92, data_max * 1.10)
+step_y <- 0.06
+
+stat_df_ci <- sig_rows %>%
+  group_by(CellTypeID) %>%
+  mutate(
+    y.position = base_y + step_y * (row_number() - 1),
+    label      = sig
+  ) %>%
+  ungroup() %>%
+  select(CellTypeID, group1, group2, y.position, label)
+
+ylim_top_ci <- if (nrow(stat_df_ci) > 0) {
+  min(1.05, max(stat_df_ci$y.position, na.rm = TRUE) + 0.06)
+} else {
+  min(1.05, max(0.85, data_max * 1.10))
+}
+
+y_breaks_ci <- seq(0, 1.2, by = 0.2)
+
+p_ci <- ggplot(CI_df, aes(x = Group, y = CI)) +
+  geom_violin(
+    aes(fill = Group),
+    trim = FALSE,
+    alpha = 0.35,
+    color = NA,
+    width = 0.95
+  ) +
+  geom_boxplot(
+    aes(fill = Group),
+    width = 0.22,
+    outlier.shape = NA,
+    alpha = 0.85,
+    linewidth = 0.8
+  ) +
+  geom_jitter(
+    aes(color = Group),
+    width = 0.15,
+    size = 2,
+    alpha = 0.55,
+    show.legend = FALSE
+  ) +
+  facet_grid(. ~ CellTypeID) +
+  scale_fill_manual(values = fill_cols, drop = FALSE) +
+  scale_color_manual(values = point_cols, drop = FALSE) +
+  scale_x_discrete(labels = c("Den1" = "Low Den", "Den10" = "High Den")) +
+  scale_y_continuous(breaks = y_breaks_ci, expand = c(0, 0)) +
+  coord_cartesian(ylim = c(0, 1.2)) +
+  {
+    if (nrow(stat_df_ci) > 0) {
+      stat_pvalue_manual(
+        stat_df_ci,
+        xmin = "group1",
+        xmax = "group2",
+        label = "label",
+        y.position = "y.position",
+        tip.length   = 0.03,
+        size         = 6,
+        bracket.size = 0.9
+      )
+    } else NULL
+  } +
+  labs(
+    title = NULL,
+    x     = "Cancer Density",
+    y     = "Travel Consistency \n(Net / Total Distance)"
+  ) +
+  theme_classic(base_size = 20) +
+  theme(
+    axis.line    = element_line(linewidth = 0.9, color = "black"),
+    axis.text.y  = element_text(size = 18),
+    axis.title.y = element_text(size = 20),
+    axis.text.x  = element_text(size = 16, angle = 0, hjust = 0.5),
+    axis.title.x = element_text(size = 16),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text.x = element_text(size = 20),
+    panel.spacing.x = unit(2, "lines")
+  )
+
+ggsave(
+  filename = "TravelConsistency_ViolinBox_StarsOnly_Den1_Den10.png",
+  plot     = p_ci,
+  width    = 6.5,
+  height   = 4.7,
+  dpi      = 600
+)
+
+p_ci
+```
+
+### 8.) Nearest-neighbor distance over time MDA -> Myoep
+```{r}
+library(RANN)
+
+frame_interval_min <- 10
+hours_per_frame <- frame_interval_min / 60
+
+CP_clean <- Combined_Positions %>%
+  dplyr::mutate(
+    Time_num = suppressWarnings(readr::parse_number(as.character(Time))),
+    X        = suppressWarnings(as.numeric(X_Position)),
+    Y        = suppressWarnings(as.numeric(Y_Position))
+  ) %>%
+  dplyr::filter(
+    is.finite(Time_num), is.finite(X), is.finite(Y),
+    Group %in% c("Den1","Den10"),
+    CellTypeID %in% c("MDAMB231","Myoepithelial")
+  )
+
+compute_nn_mda_to_myo <- function(df_clean) {
+
+  frames <- df_clean %>%
+    dplyr::group_by(SampleID, Group, Time_num) %>%
+    dplyr::group_split()
+
+  purrr::map_dfr(frames, function(df_t) {
+
+    sample_id <- df_t$SampleID[1]
+    group     <- df_t$Group[1]
+    tnum      <- df_t$Time_num[1]
+
+    mda <- df_t %>% dplyr::filter(CellTypeID == "MDAMB231")
+    myo <- df_t %>% dplyr::filter(CellTypeID == "Myoepithelial")
+
+    if (nrow(mda) == 0 || nrow(myo) == 0) return(NULL)
+
+    mda_mat <- as.matrix(mda[, c("X","Y")])
+    myo_mat <- as.matrix(myo[, c("X","Y")])
+
+    nn <- RANN::nn2(data = myo_mat, query = mda_mat, k = 1)
+
+    idx <- nn$nn.idx[, 1]
+    d1  <- nn$nn.dists[, 1]
+
+    neighbor <- myo[idx, , drop = FALSE]
+
+    tibble::tibble(
+      SampleID       = sample_id,
+      Group          = group,
+      Time_frame     = tnum,
+      Time_hr        = tnum * hours_per_frame,
+      MDA_UniqueID   = mda$UniqueID,
+      MDA_X          = mda$X,
+      MDA_Y          = mda$Y,
+      NN_Dist_um     = d1,
+      NN_UniqueID    = neighbor$UniqueID,
+      NN_CellTypeID  = neighbor$CellTypeID
+    )
+  })
+}
+
+nn_mda_to_myo <- compute_nn_mda_to_myo(CP_clean)
+
+# quick sanity
+nn_mda_to_myo %>% dplyr::count(Group) %>% print()
+nn_mda_to_myo %>% dplyr::summarise(min_d = min(NN_Dist_um), max_d = max(NN_Dist_um)) %>% print()
+```
+
+#### Viz
+```{r}
+nn_time_summary <- nn_mda_to_myo %>%
+  dplyr::group_by(Group, Time_hr) %>%
+  dplyr::summarise(
+    mean_dist = mean(NN_Dist_um, na.rm = TRUE),
+    sem_dist  = sd(NN_Dist_um, na.rm = TRUE) / sqrt(sum(is.finite(NN_Dist_um))),
+    n_cells   = sum(is.finite(NN_Dist_um)),
+    .groups   = "drop"
+  ) %>%
+  dplyr::mutate(Group = factor(Group, levels = c("Den1","Den10")))
+
+# Optional: cap x-axis to your experiment length
+xmax_hr <- max(nn_time_summary$Time_hr, na.rm = TRUE)
+x_breaks <- seq(0, ceiling(xmax_hr / 6) * 6, by = 6)
+
+p_nn_mean <- ggplot(nn_time_summary,
+                    aes(x = Time_hr, y = mean_dist, color = Group, fill = Group)) +
+  geom_ribbon(
+    aes(ymin = pmax(mean_dist - sem_dist, 0),
+        ymax = mean_dist + sem_dist),
+        alpha = 0.18, 
+        color = NA) +
+  geom_line(linewidth = 1.0) +
+  scale_color_manual(
+  values = group_colors,
+  labels = c("Den1" = "Low Den", "Den10" = "High Den"),
+  drop = FALSE
+) +
+  scale_fill_manual(
+  values = group_colors,
+  labels = c("Den1" = "Low Den", "Den10" = "High Den"),
+  drop = FALSE
+) +
+  scale_x_continuous(limits = c(0,xmax_hr), breaks = x_breaks, expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0,160)) +
+  labs(
+    x = "Time (hours)",
+    y = "Mean Distance to Nearest \nMyoep Neighbor (µm)",
+    title = "MDAMB231 to Nearest Myoepithelial"
+  ) +
+  theme_classic(base_size = 20) +
+  theme(
+    legend.position = "right",
+    legend.title = element_blank(),
+    legend.text  = element_text(size = 16),
+    axis.line    = element_line(linewidth = 0.9, color = "black"),
+    axis.text    = element_text(size = 18),
+    axis.title   = element_text(size = 20),
+    strip.background = element_blank()
+  )
+
+ggsave("NN_Distance_MDAMB231_to_Myoep_mean_over_time_Den1_Den10.png",
+       p_nn_mean, width = 8.5, height = 4.8, dpi = 600)
+
+p_nn_mean
+```
+
+### 9.) Center of Mass (COM) displacement — MDAMB231 and Myoepithelial
+```{r}
+frame_interval_min <- 10
+hours_per_frame <- frame_interval_min / 60
+
+star_from_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p <= 0.0001) return("****")
+  if (p <= 0.001)  return("***")
+  if (p <= 0.01)   return("**")
+  if (p <= 0.05)   return("*")
+  "ns"
+}
+
+prep_positions_for_com <- function(dat, celltype_use) {
+  dat %>%
+    mutate(
+      frame = suppressWarnings(readr::parse_number(as.character(Time))) %>% as.integer(),
+      X     = suppressWarnings(as.numeric(X_Position)),
+      Y     = suppressWarnings(as.numeric(Y_Position))
+    ) %>%
+    filter(
+      CellTypeID == celltype_use,
+      Group %in% c("Den1","Den10"),
+      is.finite(frame), is.finite(X), is.finite(Y)
+    ) %>%
+    arrange(SampleID, Group, UniqueID, frame) %>%
+    distinct(SampleID, UniqueID, frame, .keep_all = TRUE) %>%
+    mutate(Time_hours = frame * frame_interval_min / 60)
+}
+
+compute_com_centered <- function(cp_clean) {
+  # COM per sample per frame
+  com_raw <- cp_clean %>%
+    group_by(SampleID, Group, frame) %>%
+    summarise(
+      com_x = mean(X, na.rm = TRUE),
+      com_y = mean(Y, na.rm = TRUE),
+      Time_hours = first(Time_hours),
+      .groups = "drop"
+    )
+
+  # re-center each sample so t0 = (0,0)
+  com_centered <- com_raw %>%
+    group_by(SampleID, Group) %>%
+    arrange(Time_hours, .by_group = TRUE) %>%
+    mutate(
+      com_x0 = first(com_x[is.finite(com_x)]),
+      com_y0 = first(com_y[is.finite(com_y)]),
+      dx     = com_x - com_x0,
+      dy     = com_y - com_y0
+    ) %>%
+    ungroup()
+
+  com_centered
+}
+
+summarise_com_time <- function(com_centered) {
+  com_centered %>%
+    group_by(Group, Time_hours) %>%
+    summarise(
+      n_repl_dx = sum(is.finite(dx)),
+      n_repl_dy = sum(is.finite(dy)),
+      dx_mean   = mean(dx, na.rm = TRUE),
+      dy_mean   = mean(dy, na.rm = TRUE),
+      dx_sem    = if_else(n_repl_dx >= 2, sd(dx, na.rm = TRUE) / sqrt(n_repl_dx), NA_real_),
+      dy_sem    = if_else(n_repl_dy >= 2, sd(dy, na.rm = TRUE) / sqrt(n_repl_dy), NA_real_),
+      .groups = "drop"
+    ) %>%
+    mutate(Group = factor(Group, levels = c("Den1","Den10")))
+}
+
+plot_COM_axis <- function(df, axis_label, y_limits = NULL, y_breaks = NULL) {
+  p <- ggplot(df, aes(x = Time_hours, y = mean, color = Group, fill = Group)) +
+    geom_hline(yintercept = 0, linewidth = 0.6, color = "grey70") +
+    geom_ribbon(aes(ymin = mean - sem, ymax = mean + sem), alpha = 0.18, color = NA) +
+    geom_line(linewidth = 1.1, na.rm = TRUE) +
+    scale_color_manual(values = group_colors, drop = FALSE) +
+    scale_fill_manual(values  = group_colors, drop = FALSE) +
+    labs(
+      x = "Time (hours)",
+      y = axis_label,
+      color = "Cancer\nDensity",
+      fill  = "Cancer\nDensity"
+    ) +
+    theme_classic(base_size = 20) +
+    theme(
+      legend.position = "right",
+      legend.title = element_text(size = 16),
+      legend.text  = element_text(size = 14),
+      axis.line    = element_line(linewidth = 0.9, color = "black"),
+      axis.text    = element_text(size = 16),
+      axis.title   = element_text(size = 18)
+    )
+
+  if (!is.null(y_limits)) p <- p + scale_y_continuous(limits = y_limits, breaks = y_breaks)
+  p
+}
+
+compute_end_vectors_by_repl <- function(com_centered, tmax_hr = NULL) {
+  d <- com_centered %>%
+    filter(is.finite(Time_hours), is.finite(dx), is.finite(dy))
+
+  if (!is.null(tmax_hr)) d <- d %>% filter(Time_hours <= tmax_hr)
+
+  d %>%
+    group_by(Group, SampleID) %>%
+    summarise(
+      Time_end = max(Time_hours, na.rm = TRUE),
+      dx_end   = dx[which.max(Time_hours)],
+      dy_end   = dy[which.max(Time_hours)],
+      bearing_deg = atan2(dy_end, dx_end) * 180 / pi,
+      .groups = "drop"
+    ) %>%
+    mutate(Group = factor(Group, levels = c("Den1","Den10")))
+}
+
+plot_end_vectors <- function(repl_df, axis_lim = NULL, title = NULL) {
+  p <- ggplot(repl_df, aes(color = Group)) +
+    geom_hline(yintercept = 0, linewidth = 0.4, color = "grey85") +
+    geom_vline(xintercept = 0, linewidth = 0.4, color = "grey85") +
+    geom_segment(
+      aes(x = 0, y = 0, xend = dx_end, yend = dy_end),
+      arrow = arrow(length = unit(2.2, "mm"), type = "closed"),
+      linewidth = 1.0,
+      alpha = 0.95
+    ) +
+    scale_color_manual(values = group_colors, drop = FALSE) +
+    coord_fixed(expand = FALSE) +
+    labs(
+      title = title,
+      x = "ΔX COM displacement (µm)",
+      y = "ΔY COM displacement (µm)",
+      color = "Cancer\nDensity"
+    ) +
+    theme_classic(base_size = 18) +
+    theme(
+      legend.position = "right",
+      legend.title = element_text(size = 14),
+      legend.text  = element_text(size = 12),
+      axis.text    = element_text(size = 14),
+      axis.title   = element_text(size = 16)
+    )
+
+  if (!is.null(axis_lim)) {
+    p <- p + coord_fixed(xlim = c(-axis_lim, axis_lim), ylim = c(-axis_lim, axis_lim), expand = FALSE)
+  }
+  p
+}
+
+# time-averaged COM per replicate, then stats + boxplot
+compute_timeavg_com_by_repl <- function(com_centered) {
+  com_centered %>%
+    filter(is.finite(dx), is.finite(dy)) %>%
+    group_by(SampleID, Group) %>%
+    summarise(
+      dX_mean = mean(dx, na.rm = TRUE),
+      dY_mean = mean(dy, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(Group = factor(Group, levels = c("Den1","Den10"))) %>%
+    pivot_longer(cols = c(dX_mean, dY_mean),
+                 names_to = "Component",
+                 values_to = "Value") %>%
+    mutate(
+      Component = recode(Component,
+                         dX_mean = "ΔX (µm)",
+                         dY_mean = "ΔY (µm)"),
+      Component = factor(Component, levels = c("ΔX (µm)", "ΔY (µm)"))
+    )
+}
+
+welch_box_stats_by_component <- function(df_box) {
+
+  res <- df_box %>%
+    group_by(Component) %>%
+    group_modify(function(d, key) {
+
+      d <- d %>% tidyr::drop_na(Value, Group)
+
+      # require both groups + >=2 replicates per group
+      if (n_distinct(d$Group) < 2 || any(table(d$Group) < 2)) {
+        return(tibble(
+          p_value    = NA_real_,
+          direction  = NA_character_,
+          sig        = NA_character_,
+          statement  = paste0(as.character(key$Component), ": Not enough replicates in one group")
+        ))
+      }
+
+      tt <- t.test(Value ~ Group, data = d, var.equal = FALSE)
+      p  <- tt$p.value
+
+      means <- tapply(d$Value, d$Group, mean, na.rm = TRUE)
+      dir_txt <- if (means["Den1"] > means["Den10"]) "Den1 > Den10" else "Den10 > Den1"
+
+      tibble(
+        p_value   = p,
+        direction = dir_txt,
+        sig       = star_from_p(p),
+        statement = paste0(
+          as.character(key$Component), ": ", dir_txt,
+          " (Welch t-test p = ", signif(p, 3), ", ", star_from_p(p), ")"
+        )
+      )
+    }) %>%
+    ungroup()
+
+  res
+}
+
+build_stat_df_for_box <- function(df_box, stats_df) {
+  # Stars only, one bracket per component (if significant by raw p)
+  out <- stats_df %>%
+    filter(is.finite(p_value), sig != "ns") %>%
+    mutate(
+      group1 = "Den1",
+      group2 = "Den10"
+    )
+
+  if (nrow(out) == 0) return(tibble())
+
+  out %>%
+    group_by(Component) %>%
+    mutate(
+      ymax_comp = max(df_box$Value[df_box$Component == Component[1]], na.rm = TRUE),
+      ymin_comp = min(df_box$Value[df_box$Component == Component[1]], na.rm = TRUE),
+      step = (ymax_comp - ymin_comp) * 0.12,
+      step = ifelse(is.finite(step) & step > 0, step, 0.1),
+      y.position = ymax_comp * 1.10 + step * (row_number() - 1L),
+      label = sig
+    ) %>%
+    ungroup() %>%
+    select(Component, group1, group2, y.position, label)
+}
+
+plot_timeavg_box <- function(df_box, pval_df, title = NULL) {
+  y_min <- min(df_box$Value, na.rm = TRUE)
+  y_max_data <- max(df_box$Value, na.rm = TRUE)
+  y_max <- if (nrow(pval_df) > 0) max(y_max_data, max(pval_df$y.position, na.rm = TRUE)) * 1.05 else y_max_data * 1.10
+
+  p <- ggplot(df_box, aes(x = Group, y = Value, fill = Group)) +
+    geom_hline(yintercept = 0, linewidth = 0.6, color = "grey55") +
+    geom_boxplot(width = 0.6, alpha = 0.9, color = "black", outlier.shape = NA) +
+    geom_point(position = position_jitter(width = 0.25, height = 0),
+               size = 2.5, alpha = 0.9, color = "black") +
+    facet_grid(~ Component, switch = "x") +
+    scale_x_discrete(labels = c("Den1" = "Low Den", "Den10" = "High Den")) +
+    scale_fill_manual(values = group_colors, drop = FALSE) +
+    coord_cartesian(ylim = c(y_min * 1.05, y_max)) +
+    labs(title = title, x = NULL, y = "Time-averaged COM displacement (µm)") +
+    theme_classic(base_size = 18) +
+    theme(
+      legend.position  = "none",
+      strip.placement  = "outside",
+      strip.background = element_blank(),
+      strip.text       = element_text(size = 16),
+      axis.text        = element_text(size = 14),
+      axis.title       = element_text(size = 16),
+      panel.spacing    = unit(2, "lines")
+    )
+
+  if (nrow(pval_df) > 0) {
+    p <- p + ggpubr::stat_pvalue_manual(
+      data = pval_df,
+      label = "label",
+      xmin = "group1",
+      xmax = "group2",
+      y.position = "y.position",
+      tip.length = 0.02,
+      size = 7,
+      bracket.size = 0.7
+    )
+  }
+  p
+}
+
+run_COM_for_celltype <- function(celltype_use,
+                                 y_limits = NULL,
+                                 y_breaks = NULL,
+                                 axis_lim_vec = NULL,
+                                 tmax_hr_vec = NULL) {
+
+  cp_clean <- prep_positions_for_com(Combined_Positions, celltype_use)
+  if (nrow(cp_clean) == 0) stop(paste0("No data found for CellTypeID = ", celltype_use))
+
+  com_centered <- compute_com_centered(cp_clean)
+  com_summary  <- summarise_com_time(com_centered)
+
+  # ΔX and ΔY time-series
+  dx_df <- com_summary %>% transmute(Group, Time_hours, mean = dx_mean, sem = dx_sem)
+  dy_df <- com_summary %>% transmute(Group, Time_hours, mean = dy_mean, sem = dy_sem)
+
+  p_dx <- plot_COM_axis(dx_df, axis_label = "ΔX Center of Mass Displacement (µm)", y_limits = y_limits, y_breaks = y_breaks)
+  p_dy <- plot_COM_axis(dy_df, axis_label = "ΔY Center of Mass Displacement (µm)", y_limits = y_limits, y_breaks = y_breaks)
+
+  ggsave(paste0(celltype_use, "_COM_Displacement_DX.png"), p_dx, width = 7.5, height = 4.8, dpi = 600)
+  ggsave(paste0(celltype_use, "_COM_Displacement_DY.png"), p_dy, width = 7.5, height = 4.8, dpi = 600)
+
+  # End vectors by replicate
+  repl_vec <- compute_end_vectors_by_repl(com_centered, tmax_hr = tmax_hr_vec)
+
+  p_vec <- plot_end_vectors(
+    repl_vec,
+    axis_lim = axis_lim_vec,
+    title = paste0(celltype_use, " — COM End Vectors (by replicate)")
+  )
+  ggsave(paste0(celltype_use, "_COM_EndVectors_ByReplicate.png"), p_vec, width = 5.2, height = 5.2, dpi = 600)
+
+  # Time-averaged boxplots + stats (ΔX, ΔY)
+  df_box <- compute_timeavg_com_by_repl(com_centered)
+  stats_box <- welch_box_stats_by_component(df_box)
+  pval_df <- build_stat_df_for_box(df_box, stats_box)
+
+  p_box <- plot_timeavg_box(df_box, pval_df, title = paste0(celltype_use, " — Time-averaged COM"))
+  ggsave(paste0(celltype_use, "_COM_TimeAveraged_dX_dY_boxplot_stars.png"),
+         p_box, width = 7.2, height = 4.4, dpi = 600)
+
+  list(
+    cp_clean = cp_clean,
+    com_centered = com_centered,
+    com_summary = com_summary,
+    end_vectors = repl_vec,
+    timeavg_box_df = df_box,
+    timeavg_stats = stats_box,
+    p_dx = p_dx,
+    p_dy = p_dy,
+    p_vec = p_vec,
+    p_box = p_box
+  )
+}
+
+
+# MDAMB231
+COM_MDA <- run_COM_for_celltype(
+  celltype_use = "MDAMB231",
+  y_limits = NULL,
+  y_breaks = NULL,
+  axis_lim_vec = NULL,
+  tmax_hr_vec = NULL
+)
+
+# Myoepithelial
+COM_Myo <- run_COM_for_celltype(
+  celltype_use = "Myoepithelial",
+  y_limits = NULL,
+  y_breaks = NULL,
+  axis_lim_vec = NULL,
+  tmax_hr_vec = NULL
+)
+
+# Inspect stats text quickly
+COM_MDA$timeavg_stats$statement
+COM_Myo$timeavg_stats$statement
+
+# Display plots in-session
+COM_MDA$p_dx; COM_MDA$p_dy; COM_MDA$p_vec; COM_MDA$p_box
+COM_Myo$p_dx; COM_Myo$p_dy; COM_Myo$p_vec; COM_Myo$p_box
+
+```
+
+
+# --------------------------------------------------------------------------------------------------
+# XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+# --------------------------------------------------------------------------------------------------
+
+# Cancer Organization
+```{r}
+celltype_colors <- c(
+  "MDAMB231"     = "#B64249",
+  "Myoepithelial"= "#796089",
+  "Missing_ID"   = "#AFABAB")
+
+group_colors <- c("Segregated" = "#92A594", "Clustered" = "#C1D6E2")
+
+point_colors <- c("Segregated" = "#6C816E", "Clustered" = "#AAC2CD")
+```
+
+
+## Load data & preprocess
+```{r}
+folder <- "/Users/helmsh/Desktop/" 
+
+files <- c(
+  "Myoep_MDAMB231_Seg1.xlsx",
+  "Myoep_MDAMB231_Seg2.xlsx",
+  "Myoep_MDAMB231_Seg3.xlsx",
+  "Myoep_MDAMB231_Clus1.xlsx",
+  "Myoep_MDAMB231_Clus2.xlsx",
+  "Myoep_MDAMB231_Clus3.xlsx")
+
+# SampleID = Seg1, Seg2, ..., Clus3
+sample_names <- files %>%
+  str_remove("Myoep_MDAMB231_") %>%
+  str_remove("\\.xlsx$")
+
+# Group = Seg or Clus
+group_names <- str_extract(sample_names, "Seg|Clus") %>%
+  recode(
+    "Seg"  = "Segregated",
+    "Clus" = "Clustered"
+  )
+
+unique(sample_names)
+unique(group_names)
+
+# Load files
+data_list <- lapply(seq_along(files), function(i) {
+  read_excel(
+    path = file.path(folder, files[i]),
+    sheet = "Position",
+    skip = 1,
+    col_types = "text"
+  ) %>%
+    rename(CellTypeID = 7) %>%  
+    mutate(
+      SampleID = sample_names[i],
+      Group    = group_names[i]
+    )
+})
+
+# Combine into one dataframe
+all_positions <- bind_rows(data_list)
+
+# Clean CellTypeID to exactly 2 levels
+all_positions <- all_positions %>%
+  mutate(
+    CellTypeID = case_when(
+      grepl("^Myo", CellTypeID, ignore.case = TRUE) ~ "Myoepithelial",
+      grepl("^MDA", CellTypeID, ignore.case = TRUE) ~ "MDAMB231",
+      grepl("231",  CellTypeID, ignore.case = TRUE) ~ "MDAMB231",
+      TRUE ~ CellTypeID
+    )
+  )
+
+# sanity checks
+unique(all_positions$CellTypeID)
+unique(all_positions$Group)
+unique(all_positions$SampleID)
+head(all_positions)
+```
+
+```{r}
+# Add Unique ID - Imaris reuses track ID's across files
+all_positions <- all_positions %>%
+  mutate(UniqueID = paste(SampleID, TrackID, sep = "_"))
+
+head(all_positions)
+```
+
+```{r}
+# Confirm everything has a uniqueID. These datasets have 145 frames. If there are more than that it means there is a duplicate
+all_positions %>%
+  count(UniqueID) %>%
+  arrange(desc(n))
+```
+
+```{r}
+# Can also confirm UniqueID through this. If any UniqueID maps to >1 SampleID or >1 TrackID, something is wrong
+uid_integrity <- all_positions %>%
+  group_by(UniqueID) %>%
+  summarise(
+    n_sample = n_distinct(SampleID),
+    n_track  = n_distinct(TrackID),
+    n_group  = n_distinct(Group),
+    .groups = "drop"
+  ) %>%
+  filter(n_sample > 1 | n_track > 1 | n_group > 1)
+
+uid_integrity
+```
+
+```{r}
+missing_tracks <- all_positions %>%
+  filter(CellTypeID == "Missing_ID") %>%
+  distinct(SampleID, UniqueID)
+
+missing_tracks
+n_missing <- nrow(missing_tracks)
+n_missing
+```
+
+```{r}
+# Remove spaces in col names, i.e. "Position X" to "X_Position". Spaces cause problems. Also renaming ID because it seemed to want to pull functions instead of data
+all_positions <- all_positions %>%
+  rename(
+    X_Position = `Position X`,
+    Y_Position = `Position Y`,
+    SpotID     = `ID`)
+
+head(all_positions)
+```
+
+```{r}
+# Make SpotID all the same number of characters for easier sorting
+all_positions$SpotID <- str_pad(all_positions$SpotID, width = 6, side = "left", pad = "0")
+
+head(all_positions)
+```
+
+```{r}
+# One of the short track ID's is 000000. Rename to 999999
+all_positions$SpotID[all_positions$SpotID == "000000"] <- "999999"
+
+head(all_positions)
+```
+
+```{r}
+# Make time all the same number of characters
+all_positions$Time <- str_pad(all_positions$Time, width = 3, side = "left", pad = "0")
+
+head(all_positions)
+```
+
+```{r}
+# Reorder cols so it is easier to work with
+all_positions_cleaned <- all_positions %>%
+  select(SampleID, UniqueID, CellTypeID, Time, X_Position, Y_Position, Group, Unit, Category, Collection, TrackID, SpotID)
+
+head(all_positions_cleaned)
+```
+
+```{r}
+# Rearrange so that is sorted by SampleID, then UniqueID, then Time so we can separate out the duplicates
+Combined_Positions <- all_positions_cleaned %>% arrange(SampleID, UniqueID, Time)
+
+head(Combined_Positions)
+```
+
+```{r}
+unique(Combined_Positions$CellTypeID)
+unique(Combined_Positions$Group)
+unique(Combined_Positions$SampleID)
+```
+
+
+## Analysis
+### 1.) Migration Track Plots
+#### Raw Data - Each Sample Individually
+```{r}
+samples_to_plot <- sort(unique(Combined_Positions$SampleID))
+
+span_x <- 800
+span_y <- 800
+tick   <- 200
+
+for (sample_to_plot in samples_to_plot) {
+
+  df_tracks <- Combined_Positions %>%
+    filter(SampleID == sample_to_plot, CellTypeID != "Missing_ID") %>%
+    mutate(
+      TimeNum = suppressWarnings(readr::parse_number(Time)),
+      X       = suppressWarnings(readr::parse_number(X_Position)),
+      Y       = suppressWarnings(readr::parse_number(Y_Position))
+    ) %>%
+    filter(is.finite(TimeNum), is.finite(X), is.finite(Y)) %>%
+    arrange(UniqueID, TimeNum)
+
+  if (nrow(df_tracks) == 0) next
+
+  # Define the viewing window using the start frame (Time == "001")
+  df_start <- df_tracks %>% filter(Time == "001")
+  if (nrow(df_start) == 0) next
+
+  # Center of the start frame bounding box
+  x0 <- mean(range(df_start$X, na.rm = TRUE))
+  y0 <- mean(range(df_start$Y, na.rm = TRUE))
+
+  # Start with a centered window
+  x_centered_limits <- c(x0 - span_x/2, x0 + span_x/2)
+  y_centered_limits <- c(y0 - span_y/2, y0 + span_y/2)
+
+  # but convert it to "xmin anchored" integer limits with no decimals:
+  x_min <- as.integer(floor(x_centered_limits[1]))
+  y_min <- as.integer(floor(y_centered_limits[1]))
+
+  x_limits <- c(x_min, x_min + span_x)
+  y_limits <- c(y_min, y_min + span_y)
+
+  # Ticks: xmin/ymin + 200 increments, total span 800
+  x_breaks <- seq(x_limits[1], x_limits[2], by = tick)
+  y_breaks <- seq(y_limits[1], y_limits[2], by = tick)
+
+  p_tracks <- ggplot(
+    df_tracks,
+    aes(x = X, y = Y, group = UniqueID, color = CellTypeID)
+  ) +
+    geom_path(linewidth = 0.6, alpha = 0.6, na.rm = TRUE) +
+    scale_x_continuous(limits = x_limits, breaks = x_breaks, expand = c(0, 0)) +
+    scale_y_continuous(limits = y_limits, breaks = y_breaks, expand = c(0, 0)) +
+    scale_color_manual(values = celltype_colors, drop = FALSE) +
+    labs(
+      title = paste0(sample_to_plot, " — All tracks"),
+      x = "X (µm)",
+      y = "Y (µm)",
+      color = "Cell type"
+    ) +
+    theme_classic(base_size = 20) +
+    theme(
+      axis.line = element_line(linewidth = 0.6),
+      axis.title = element_text(size = 16),
+      axis.text  = element_text(size = 12),
+      plot.title = element_text(size = 20, face = "bold")
+    )
+
+  ggsave(
+    filename = paste0(sample_to_plot, "_AllTracks_FIXEDWINDOW.png"),
+    plot = p_tracks,
+    width = 6,
+    height = 4,
+    dpi = 600
+  )
+
+  print(p_tracks)
+}
+```
+
+#### Centered
+```{r}
+# Find bounding box to align the samples
+bb_by_sample <- Combined_Positions %>%
+  mutate(
+    X = suppressWarnings(readr::parse_number(X_Position)),
+    Y = suppressWarnings(readr::parse_number(Y_Position))
+  ) %>%
+  filter(is.finite(X), is.finite(Y)) %>%
+  group_by(SampleID) %>%
+  summarise(
+    xmin = min(X, na.rm = TRUE),
+    xmax = max(X, na.rm = TRUE),
+    ymin = min(Y, na.rm = TRUE),
+    ymax = max(Y, na.rm = TRUE),
+    x_range = xmax - xmin,
+    y_range = ymax - ymin,
+    .groups = "drop"
+  ) %>%
+  arrange(SampleID)
+
+bb_by_sample
+
+bb_by_sample %>%
+  summarise(
+    max_x_range = max(x_range, na.rm = TRUE),
+    max_y_range = max(y_range, na.rm = TRUE)
+  )
+```
+
+##### Individual samples
+```{r}
+# Center each SampleID using only the start frame (Time == "001"). Then apply that shift to all timepoints in that sample
+
+x_limits <- c(-451.85, 451.85)
+y_limits <- c(-453.06, 454.06)
+axis_breaks <- c(-450, -225, 0, 225, 450)
+
+CP_start_centered <- Combined_Positions %>%
+  mutate(
+    TimeNum = suppressWarnings(readr::parse_number(Time)),
+    X = suppressWarnings(readr::parse_number(X_Position)),
+    Y = suppressWarnings(readr::parse_number(Y_Position))
+  ) %>%
+  filter(is.finite(TimeNum), is.finite(X), is.finite(Y)) %>%
+
+  # compute per-sample start-frame center (Time == "001")
+  group_by(SampleID) %>%
+  mutate(
+    start_x_mid = {
+      xs <- X[Time == "001"]
+      (min(xs, na.rm = TRUE) + max(xs, na.rm = TRUE)) / 2
+    },
+    start_y_mid = {
+      ys <- Y[Time == "001"]
+      (min(ys, na.rm = TRUE) + max(ys, na.rm = TRUE)) / 2
+    },
+
+    # shift all timepoints by that start-frame center
+    Xc = X - start_x_mid,
+    Yc = Y - start_y_mid
+  ) %>%
+  ungroup()
+
+plot_tracks_fixedbox_startcenter <- function(sample_to_plot, cell_filter = c("all", "MDAMB231", "Myoepithelial")) {
+
+  cell_filter <- match.arg(cell_filter)
+
+  df_tracks <- CP_start_centered %>%
+    filter(SampleID == sample_to_plot, CellTypeID != "Missing_ID") %>%
+    { if (cell_filter == "all") . else filter(., CellTypeID == cell_filter) } %>%
+    arrange(UniqueID, TimeNum)
+
+  # if a sample is missing that cell type, just return NULL
+  if (nrow(df_tracks) == 0) return(NULL)
+
+  ggplot(df_tracks, aes(x = Xc, y = Yc, group = UniqueID, color = CellTypeID)) +
+    geom_path(linewidth = 0.6, alpha = 0.6, na.rm = TRUE) +
+    coord_equal() +
+    scale_x_continuous(limits = x_limits, breaks = axis_breaks, expand = c(0, 0)) +
+    scale_y_continuous(limits = y_limits, breaks = axis_breaks, expand = c(0, 0)) +
+    scale_color_manual(values = celltype_colors, drop = FALSE) +
+    labs(
+      title = paste0(sample_to_plot, " centered by start frame (Time 001) — ", cell_filter),
+      x = "X (µm)",
+      y = "Y (µm)",
+      color = "Cell type"
+    ) +
+  theme_classic(base_size = 20) +
+  theme(
+    axis.line    = element_line(linewidth = 0.9, color = "black"),
+    axis.text.y  = element_text(size = 18),
+    axis.title.y = element_text(size = 20),
+    axis.text.x  = element_text(size = 16, angle = 0, hjust = 0.5),
+    axis.title.x = element_text(size = 16),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text.x = element_text(size = 20),
+    panel.spacing.x = unit(2, "lines")
+  )
+}
+
+## Loop and save all samples: All tracks + MDAMB231-only + Myoep-only
+samples <- c("Clus1","Clus2","Clus3","Seg1","Seg2","Seg3")
+
+for (sid in samples) {
+
+  # 1) all tracks
+  p_all <- plot_tracks_fixedbox_startcenter(sid, "all")
+  if (!is.null(p_all)) {
+    ggsave(
+      filename = paste0(sid, "_Tracks_All_StartCentered_FixedBox.png"),
+      plot = p_all,
+      width = 7,
+      height = 6,
+      dpi = 600
+    )
+  }
+
+  # 2) MDAMB231-only
+  p_mda <- plot_tracks_fixedbox_startcenter(sid, "MDAMB231")
+  if (!is.null(p_mda)) {
+    ggsave(
+      filename = paste0(sid, "_Tracks_MDAMB231_StartCentered_FixedBox.png"),
+      plot = p_mda,
+      width = 7,
+      height = 6,
+      dpi = 600
+    )
+  }
+
+  # 3) Myoep-only
+  p_myo <- plot_tracks_fixedbox_startcenter(sid, "Myoepithelial")
+  if (!is.null(p_myo)) {
+    ggsave(
+      filename = paste0(sid, "_Tracks_Myoepithelial_StartCentered_FixedBox.png"),
+      plot = p_myo,
+      width = 7,
+      height = 6,
+      dpi = 600
+    )
+  }
+}
+```
+
+##### Grouped
+```{r}
+x_limits <- c(-451.85, 451.85)
+y_limits <- c(-453.06, 454.06)
+axis_breaks <- c(-450, -225, 0, 225, 450)
+
+plot_group_tracks_fixedbox_startcenter <- function(group_to_plot,
+                                                  cell_filter = c("all", "MDAMB231", "Myoepithelial")) {
+
+  cell_filter <- match.arg(cell_filter)
+
+  df_tracks <- CP_start_centered %>%
+    filter(Group == group_to_plot, CellTypeID != "Missing_ID") %>%
+    { if (cell_filter == "all") . else dplyr::filter(., CellTypeID == cell_filter) } %>%
+    arrange(SampleID, UniqueID, TimeNum)
+
+  if (nrow(df_tracks) == 0) return(NULL)
+
+  ggplot(
+    df_tracks,
+    aes(
+      x = Xc,
+      y = Yc,
+      group = UniqueID,        
+      color = CellTypeID
+    )
+  ) +
+    geom_path(linewidth = 0.6, alpha = 0.6, na.rm = TRUE) +
+    coord_equal() +
+    scale_x_continuous(limits = x_limits, breaks = axis_breaks, expand = c(0, 0)) +
+    scale_y_continuous(limits = y_limits, breaks = axis_breaks, expand = c(0, 0)) +
+    scale_color_manual(values = celltype_colors, drop = FALSE) +
+    theme_classic(base_size = 20) +
+    labs(
+      title = paste0(group_to_plot, cell_filter),
+      x = "X (µm)",
+      y = "Y (µm)",
+      color = "Cell type"
+    )
+}
+
+## Make + save all 6 plot variations:
+groups_to_plot <- c("Clustered", "Segregated")
+cell_filters <- c("all", "MDAMB231", "Myoepithelial")
+
+for (g in groups_to_plot) {
+  for (cf in cell_filters) {
+
+    p <- plot_group_tracks_fixedbox_startcenter(g, cf)
+
+    if (!is.null(p)) {
+      ggsave(
+        filename = paste0(g, "_Tracks_", cf, "_Centered.png"),
+        plot = p,
+        width = 7,
+        height = 6,
+        dpi = 600
+      )
+    }
+  }
+}
+```
+
+#### Relative Position
+```{r}
+#### Relative Position (Spatial dataset: Segregated vs Clustered)
+
+# 1) Build relative coordinates per track (anchor at first observed non-NA position)
+Combined_Positions_Relative <- Combined_Positions %>%
+  mutate(
+    Xnum = suppressWarnings(readr::parse_number(as.character(X_Position))),
+    Ynum = suppressWarnings(readr::parse_number(as.character(Y_Position))),
+    Tnum = suppressWarnings(readr::parse_number(as.character(Time))) %>% as.integer()
+  ) %>%
+  filter(
+    is.finite(Tnum), is.finite(Xnum), is.finite(Ynum),
+    CellTypeID != "Missing_ID",
+    Group %in% c("Segregated", "Clustered"),
+    CellTypeID %in% c("MDAMB231", "Myoepithelial")
+  ) %>%
+  arrange(SampleID, UniqueID, Tnum) %>%
+  group_by(SampleID, UniqueID) %>%
+  # anchor each track at its first *observed* (non-NA) position
+  mutate(
+    .x0 = {
+      ix <- which(!is.na(Xnum))
+      if (length(ix)) Xnum[ix[1]] else NA_real_
+    },
+    .y0 = {
+      iy <- which(!is.na(Ynum))
+      if (length(iy)) Ynum[iy[1]] else NA_real_
+    },
+    RelX = Xnum - .x0,
+    RelY = Ynum - .y0
+  ) %>%
+  ungroup() %>%
+  select(
+    SampleID, UniqueID, CellTypeID, Time,
+    X_Position, Y_Position, Group, Unit, Category, Collection, SpotID,
+    RelX, RelY
+  )
+
+# Sanity check: first point of every track should be (0,0)
+Combined_Positions_Relative %>%
+  group_by(SampleID, UniqueID) %>%
+  slice(1) %>%
+  summarise(first_RelX = first(RelX), first_RelY = first(RelY), .groups = "drop") %>%
+  summarise(
+    n_tracks      = n(),
+    n_zero_start  = sum(first_RelX == 0 & first_RelY == 0, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  print()
+```
+
+```{r}
+# 2) Plot helper (fixed axes, same aesthetic as your other dataset)
+
+CP_rel <- Combined_Positions_Relative %>%
+  mutate(
+    RelX = as.numeric(RelX),
+    RelY = as.numeric(RelY)
+  )
+
+plot_tracks_rel_fixed <- function(df, title, show_legend = TRUE) {
+  ggplot(
+    df,
+    aes(
+      x = RelX,
+      y = RelY,
+      group = interaction(SampleID, UniqueID),
+      color = CellTypeID
+    )
+  ) +
+    geom_path(linewidth = 0.6, alpha = 0.6, na.rm = TRUE) +
+    guides(color = guide_legend(override.aes = list(linewidth = 2))) +
+    coord_equal() +
+    scale_x_continuous(
+      limits = c(-445, 450),
+      breaks = c(-400, -200, 0, 200, 400),
+      expand = c(0, 0)
+    ) +
+    scale_y_continuous(
+      limits = c(-450, 450),
+      breaks = c(-400, -200, 0, 200, 400),
+      expand = c(0, 0)
+    ) +
+    scale_color_manual(values = celltype_colors, drop = FALSE) +
+    theme_classic(base_size = 20) +
+    theme(
+      axis.title        = element_text(size = 20),
+      axis.text         = element_text(size = 20),
+      plot.title        = element_text(size = 20, face = "bold"),
+      legend.title      = element_text(size = 24),
+      legend.text       = element_text(size = 22),
+      legend.key.height = unit(30, "pt"),
+      legend.key.width  = unit(30, "pt"),
+      legend.position   = if (show_legend) "right" else "none"
+    ) +
+    labs(
+      title = title,
+      x = "Relative X Position (µm)",
+      y = "Relative Y Position (µm)",
+      color = "Track Identity"
+    )
+}
+
+seg_rel  <- CP_rel %>% filter(Group == "Segregated")
+clus_rel <- CP_rel %>% filter(Group == "Clustered")
+```
+
+```{r}
+# 3) Group-level exports (All / MDAMB231 / Myoepithelial)
+
+# Segregated
+p_seg_all <- plot_tracks_rel_fixed(seg_rel,  "Segregated — Relative: All Tracks", show_legend = TRUE)
+p_seg_mda <- plot_tracks_rel_fixed(seg_rel %>% filter(CellTypeID == "MDAMB231"),
+                                   "Segregated — Relative: MDAMB231 Tracks", show_legend = TRUE)
+p_seg_myo <- plot_tracks_rel_fixed(seg_rel %>% filter(CellTypeID == "Myoepithelial"),
+                                   "Segregated — Relative: Myoepithelial Tracks", show_legend = TRUE)
+
+ggsave("Segregated_Relative_All_Tracks.png",           p_seg_all, width = 7, height = 6, dpi = 600)
+ggsave("Segregated_Relative_MDAMB231_Tracks.png",      p_seg_mda, width = 7, height = 6, dpi = 600)
+ggsave("Segregated_Relative_Myoepithelial_Tracks.png", p_seg_myo, width = 7, height = 6, dpi = 600)
+
+# Clustered
+p_clus_all <- plot_tracks_rel_fixed(clus_rel, "Clustered — Relative: All Tracks", show_legend = TRUE)
+p_clus_mda <- plot_tracks_rel_fixed(clus_rel %>% filter(CellTypeID == "MDAMB231"),
+                                    "Clustered — Relative: MDAMB231 Tracks", show_legend = TRUE)
+p_clus_myo <- plot_tracks_rel_fixed(clus_rel %>% filter(CellTypeID == "Myoepithelial"),
+                                    "Clustered — Relative: Myoepithelial Tracks", show_legend = TRUE)
+
+ggsave("Clustered_Relative_All_Tracks.png",           p_clus_all, width = 7, height = 6, dpi = 600)
+ggsave("Clustered_Relative_MDAMB231_Tracks.png",      p_clus_mda, width = 7, height = 6, dpi = 600)
+ggsave("Clustered_Relative_Myoepithelial_Tracks.png", p_clus_myo, width = 7, height = 6, dpi = 600)
+
+p_seg_all
+p_clus_all
+```
+
+```{r}
+# 4) Per-sample exports (All / MDAMB231 / Myoepithelial) with legend off
+
+samples_rel <- sort(unique(CP_rel$SampleID))
+
+for (s in samples_rel) {
+  d <- CP_rel %>% filter(SampleID == s)
+
+  p_all <- plot_tracks_rel_fixed(d, paste0(s, " — Relative: All Tracks"), show_legend = FALSE)
+  p_mda <- plot_tracks_rel_fixed(d %>% filter(CellTypeID == "MDAMB231"),
+                                 paste0(s, " — Relative: MDAMB231 Tracks"), show_legend = FALSE)
+  p_myo <- plot_tracks_rel_fixed(d %>% filter(CellTypeID == "Myoepithelial"),
+                                 paste0(s, " — Relative: Myoepithelial Tracks"), show_legend = FALSE)
+
+  ggsave(paste0(s, "_Relative_All_Tracks.png"),           p_all, width = 6, height = 6, dpi = 600)
+  ggsave(paste0(s, "_Relative_MDAMB231_Tracks.png"),      p_mda, width = 6, height = 6, dpi = 600)
+  ggsave(paste0(s, "_Relative_Myoepithelial_Tracks.png"), p_myo, width = 6, height = 6, dpi = 600)
+}
+```
+
+### 2.) Convex Hull - Migration territory 
+```{r}
+Combined_Positions_Relative <- Combined_Positions_Relative %>%
+  dplyr::mutate(
+    Group = dplyr::case_when(
+      Group %in% c("Segregated", "Clustered") ~ Group,
+      TRUE ~ NA_character_
+    ),
+    Group = factor(Group, levels = c("Segregated", "Clustered"))
+  )
+
+ConvexAreas <- Combined_Positions_Relative %>%
+  dplyr::group_by(SampleID, UniqueID, CellTypeID, Group) %>%
+  dplyr::summarise(
+    area = {
+      pts <- cbind(RelX, RelY)
+      pts <- pts[complete.cases(pts), , drop = FALSE]
+      if (nrow(pts) < 3) NA_real_ else geometry::convhulln(pts, "FA")$area
+    },
+    .groups = "drop"
+  )
+```
+
+#### Hull Viz
+```{r}
+.clean_pts <- function(df, x = "RelX", y = "RelY") {
+  pts <- df[, c(x, y), drop = FALSE]
+  pts[[x]] <- as.numeric(pts[[x]])
+  pts[[y]] <- as.numeric(pts[[y]])
+  pts <- pts[is.finite(pts[[x]]) & is.finite(pts[[y]]), , drop = FALSE]
+  pts <- dplyr::distinct(pts) # remove exact duplicates
+  pts
+}
+
+hull_df <- function(df, x = "RelX", y = "RelY") {
+  pts <- .clean_pts(df, x, y)
+  if (nrow(pts) < 3) return(NULL)
+  idx <- chull(pts[[x]], pts[[y]])
+  out <- pts[idx, , drop = FALSE]
+  rbind(out, out[1, , drop = FALSE]) # close polygon
+}
+
+build_per_track_hulls <- function(dat, x = "RelX", y = "RelY") {
+  dat %>%
+    dplyr::group_by(SampleID, UniqueID, CellTypeID) %>%
+    dplyr::group_modify(~{
+      h <- hull_df(.x, x, y)
+      if (is.null(h)) return(tibble::tibble(RelX = numeric(0), RelY = numeric(0)))
+      tibble::tibble(RelX = h[[x]], RelY = h[[y]])
+    }) %>%
+    dplyr::ungroup()
+}
+
+build_sample_hull <- function(dat, x = "RelX", y = "RelY") {
+  h <- hull_df(dat, x, y)
+  if (is.null(h)) return(NULL)
+  tibble::tibble(RelX = h[[x]], RelY = h[[y]])
+}
+
+base_style <- function(show_legend = FALSE) {
+  theme_classic(base_size = 20) +
+    theme(
+      legend.position = if (show_legend) "right" else "none",
+      axis.title = element_text(size = 20),
+      axis.text  = element_text(size = 20),
+      plot.title = element_text(size = 20, face = "bold")
+    )
+}
+
+plot_sample_with_hulls <- function(sample_id,
+                                   cell_filter = c("ALL", "MDAMB231", "Myoepithelial"),
+                                   per_track_hulls = TRUE,
+                                   sample_hull = TRUE,
+                                   fixed_limits = c(-300, 300, -300, 300),
+                                   show_legend = FALSE) {
+
+  cell_filter <- match.arg(cell_filter)
+
+  df_plot <- Combined_Positions_Relative %>%
+    dplyr::filter(SampleID == sample_id, CellTypeID != "Missing_ID") %>%
+    dplyr::mutate(RelX = as.numeric(RelX), RelY = as.numeric(RelY)) %>%
+    dplyr::filter(is.finite(RelX), is.finite(RelY))
+
+  if (cell_filter != "ALL") df_plot <- df_plot %>% dplyr::filter(CellTypeID == cell_filter)
+  if (!nrow(df_plot)) return(ggplot() + ggtitle(paste0(sample_id, " — EMPTY")))
+
+  xlim <- fixed_limits[1:2]
+  ylim <- fixed_limits[3:4]
+
+  df_hull <- df_plot %>%
+    dplyr::filter(
+      dplyr::between(RelX, xlim[1], xlim[2]),
+      dplyr::between(RelY, ylim[1], ylim[2])
+    )
+
+  per_track <- if (per_track_hulls) build_per_track_hulls(df_hull) else NULL
+  smp_hull  <- if (sample_hull)      build_sample_hull(df_hull)    else NULL
+
+  p <- ggplot(df_plot, aes(x = RelX, y = RelY, group = UniqueID, color = CellTypeID)) +
+    geom_path(linewidth = 0.6, alpha = 0.6, na.rm = TRUE) +
+    coord_equal() +
+    scale_x_continuous(
+      limits = xlim, breaks = c(-300, -150, 0, 150, 300), expand = c(0, 0)
+    ) +
+    scale_y_continuous(
+      limits = ylim, breaks = c(-300, -150, 0, 150, 300), expand = c(0, 0)
+    ) +
+    scale_color_manual(values = celltype_colors, drop = FALSE) +
+    scale_fill_manual(values = celltype_colors, drop = FALSE) +
+    labs(
+      title = paste0(sample_id, " — Convex Hulls, Relative XY (", cell_filter, ")"),
+      x = "Relative X Position (µm)",
+      y = "Relative Y Position (µm)",
+      color = "Cell Type"
+    ) +
+    base_style(show_legend)
+
+  if (!is.null(per_track) && nrow(per_track)) {
+    per_track <- per_track %>%
+      dplyr::left_join(
+        df_hull %>% dplyr::distinct(SampleID, UniqueID, CellTypeID),
+        by = c("SampleID", "UniqueID", "CellTypeID")
+      )
+
+    p <- p +
+      geom_polygon(
+        data = per_track,
+        aes(x = RelX, y = RelY, group = UniqueID, fill = CellTypeID, color = CellTypeID),
+        linewidth = 0.4, alpha = 0.15, inherit.aes = FALSE
+      )
+  }
+
+  if (!is.null(smp_hull)) {
+    p <- p +
+      geom_path(
+        data = smp_hull,
+        aes(x = RelX, y = RelY),
+        color = "black", linewidth = 1.4, inherit.aes = FALSE
+      )
+  }
+
+  p
+}
+
+samples <- sort(unique(Combined_Positions_Relative$SampleID))
+
+for (s in samples) {
+  ggsave(
+    filename = paste0(s, "_Rel_MDAMB231_withHulls_fixed300.png"),
+    plot     = plot_sample_with_hulls(s, "MDAMB231"),
+    width    = 7, height = 6, dpi = 600
+  )
+}
+```
+
+#### Grouped on one plot
+```{r}
+hull_df <- function(df, x = "RelX", y = "RelY") {
+  pts <- df[, c(x, y), drop = FALSE]
+  pts[[x]] <- suppressWarnings(as.numeric(pts[[x]]))
+  pts[[y]] <- suppressWarnings(as.numeric(pts[[y]]))
+  pts <- pts[is.finite(pts[[x]]) & is.finite(pts[[y]]), , drop = FALSE]
+  pts <- dplyr::distinct(pts)
+
+  if (nrow(pts) < 3) return(NULL)
+
+  idx <- chull(pts[[x]], pts[[y]])
+  out <- pts[idx, , drop = FALSE]
+  out <- rbind(out, out[1, , drop = FALSE])  # close polygon
+  names(out) <- c("RelX", "RelY")
+  out
+}
+
+build_sample_hulls <- function(dat, cell_filter = "MDAMB231") {
+  df <- dat %>%
+    dplyr::filter(CellTypeID != "Missing_ID") %>%
+    dplyr::mutate(
+      RelX = suppressWarnings(as.numeric(RelX)),
+      RelY = suppressWarnings(as.numeric(RelY))
+    ) %>%
+    dplyr::filter(is.finite(RelX), is.finite(RelY))
+
+  if (!identical(cell_filter, "ALL")) {
+    df <- df %>% dplyr::filter(CellTypeID == cell_filter)
+  }
+
+  df %>%
+    dplyr::group_by(Group, SampleID) %>%
+    dplyr::summarise(
+      poly = list(hull_df(dplyr::pick(dplyr::everything()), "RelX", "RelY")),
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(!purrr::map_lgl(poly, is.null)) %>%
+    tidyr::unnest(poly)
+}
+
+plot_group_hull_overlays <- function(hulls_df,
+                                     group_name = c("Segregated", "Clustered"),
+                                     fixed_limits = c(-300, 300, -300, 300),
+                                     pad = 12,
+                                     title = NULL,
+                                     show_legend = TRUE) {
+
+  group_name <- match.arg(group_name)
+
+  h <- hulls_df %>% dplyr::filter(Group == group_name)
+  if (!nrow(h)) return(ggplot() + ggtitle(paste0(group_name, " — EMPTY")))
+
+  samples <- sort(unique(h$SampleID))
+  repnum  <- stringr::str_extract(samples, "\\d+$")
+  style_by_rep <- c("1" = "solid", "2" = "longdash", "3" = "1212")
+  lt_vals <- style_by_rep[repnum]
+  lt_vals[is.na(lt_vals)] <- "solid"
+  lt_map <- setNames(lt_vals, samples)
+
+  outline_col <- if (!is.null(celltype_colors[["MDAMB231"]])) celltype_colors[["MDAMB231"]] else "#B64249"
+  fill_cols_h <- setNames(rep(outline_col, length(samples)), samples)
+
+  xlim <- c(fixed_limits[1] - pad, fixed_limits[2] + pad)
+  ylim <- c(fixed_limits[3] - pad, fixed_limits[4] + pad)
+
+  ggplot(h, aes(x = RelX, y = RelY, group = SampleID)) +
+    geom_polygon(aes(fill = SampleID), alpha = 0.22, color = NA) +
+    geom_path(aes(linetype = SampleID), color = outline_col, linewidth = 1.6) +
+    coord_fixed(xlim = xlim, ylim = ylim, expand = FALSE, clip = "off") +
+    scale_linetype_manual(values = lt_map, drop = FALSE) +
+    scale_fill_manual(values = fill_cols_h, drop = FALSE) +
+    scale_x_continuous(breaks = c(-300, -150, 0, 150, 300), expand = c(0, 0)) +
+    scale_y_continuous(breaks = c(-300, -150, 0, 150, 300), expand = c(0, 0)) +
+    labs(
+      title    = if (is.null(title)) paste0("MDAMB231 — ", group_name, " Sample Hull Overlays") else title,
+      x        = "Relative X Position (µm)",
+      y        = "Relative Y Position (µm)",
+      linetype = "Sample",
+      fill     = "Sample"
+    ) +
+    theme_classic(base_size = 22) +
+    theme(
+      legend.position = if (show_legend) "right" else "none",
+      axis.title = element_text(size = 20),
+      axis.text  = element_text(size = 18),
+      plot.title = element_text(size = 22, face = "bold"),
+      plot.margin = grid::unit(c(12, 18, 12, 12), "pt")
+    )
+}
+
+sample_hulls_MDA <- build_sample_hulls(Combined_Positions_Relative, cell_filter = "MDAMB231")
+
+p_seg_hull <- plot_group_hull_overlays(
+  sample_hulls_MDA, "Segregated",
+  fixed_limits = c(-300, 300, -300, 300),
+  pad = 12,
+  title = "MDAMB231 — Segregated (Sample Hull Overlays)",
+  show_legend = TRUE
+)
+
+p_clus_hull <- plot_group_hull_overlays(
+  sample_hulls_MDA, "Clustered",
+  fixed_limits = c(-300, 300, -300, 300),
+  pad = 12,
+  title = "MDAMB231 — Clustered (Sample Hull Overlays)",
+  show_legend = TRUE
+)
+
+ggsave("ConvexHulls_MDAMB231_Segregated_Overlays.png", p_seg_hull,  width = 7, height = 6, dpi = 600)
+ggsave("ConvexHulls_MDAMB231_Clustered_Overlays.png",  p_clus_hull, width = 7, height = 6, dpi = 600)
+
+p_seg_hull
+p_clus_hull
+```
+
+#### Stats
+```{r}
+SampleHullAreas <- Combined_Positions_Relative %>%
+  dplyr::filter(CellTypeID == "MDAMB231", Group %in% c("Segregated", "Clustered")) %>%
+  dplyr::mutate(
+    RelX = suppressWarnings(as.numeric(RelX)),
+    RelY = suppressWarnings(as.numeric(RelY))
+  ) %>%
+  dplyr::filter(is.finite(RelX), is.finite(RelY)) %>%
+  dplyr::group_by(SampleID, Group) %>%
+  dplyr::summarise(
+    hull_area = {
+      pts <- cbind(RelX, RelY)
+      pts <- pts[complete.cases(pts), , drop = FALSE]
+      if (nrow(pts) < 3) NA_real_ else geometry::convhulln(pts, "FA")$area
+    },
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(Group = factor(Group, levels = c("Segregated", "Clustered")))
+
+tt_dat <- SampleHullAreas %>%
+  dplyr::filter(!is.na(hull_area), is.finite(hull_area), hull_area > 0)
+
+t.test(hull_area ~ Group, data = tt_dat, var.equal = FALSE)
+```
+
+#### Per sample quant
+```{r}
+df_plot <- SampleHullAreas %>%
+  dplyr::filter(!is.na(hull_area), is.finite(hull_area), hull_area > 0) %>%
+  dplyr::mutate(Group = factor(Group, levels = c("Segregated", "Clustered")))
+
+star_from_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p < 0.0001) return("****")
+  if (p < 0.001)  return("***")
+  if (p < 0.01)   return("**")
+  if (p < 0.05)   return("*")
+  "ns"
+}
+
+tt   <- t.test(hull_area ~ Group, data = df_plot, var.equal = FALSE)
+pval <- tt$p.value
+sig  <- star_from_p(pval)
+
+data_max <- max(df_plot$hull_area, na.rm = TRUE)
+
+# bracket position
+base_y <- data_max * 1.06
+
+stat_df_hull <- tibble::tibble(
+  group1     = "Segregated",
+  group2     = "Clustered",
+  y.position = base_y,
+  label      = sig
+) %>%
+  dplyr::filter(!is.na(label), label != "ns")
+
+ylim_top_hull <- if (nrow(stat_df_hull) > 0) {
+  max(stat_df_hull$y.position, na.rm = TRUE) * 1.08
+} else {
+  data_max * 1.05
+}
+
+# breaks: 250 if under ~2000 else 500
+step <- if (ylim_top_hull <= 2000) 250 else 500
+ymax_break <- ceiling(ylim_top_hull / step) * step
+y_breaks <- seq(0, ymax_break, by = step)
+
+p_box <- ggplot(df_plot, aes(x = Group, y = hull_area)) +
+  geom_boxplot(
+    aes(fill = Group),
+    width         = 0.55,
+    outlier.shape = NA,
+    alpha         = 0.85,
+    linewidth     = 0.8
+  ) +
+  geom_jitter(
+    aes(color = Group),
+    width = 0.15,
+    size  = 3,
+    alpha = 0.8,
+    show.legend = FALSE
+  ) +
+  scale_x_discrete(labels = c("Segregated" = "Segregated", "Clustered" = "Clustered")) +
+  scale_fill_manual(values = group_colors, drop = FALSE) +
+  scale_color_manual(values = point_colors, drop = FALSE) +
+  scale_y_continuous(breaks = y_breaks, expand = c(0, 0)) +
+  coord_cartesian(ylim = c(0, ylim_top_hull)) +
+  {
+    if (nrow(stat_df_hull) > 0) {
+      ggpubr::stat_pvalue_manual(
+        stat_df_hull,
+        xmin = "group1",
+        xmax = "group2",
+        label = "label",
+        y.position = "y.position",
+        tip.length   = 0.03,
+        size         = 14,
+        bracket.size = 0.9
+      )
+    } else {
+      NULL
+    }
+  } +
+  labs(
+    title = "MDAMB231",
+    x     = "Spatial Arrangement",
+    y     = expression("TNBC Migration Territory ("*mu*m^2*")")
+  ) +
+  theme_classic(base_size = 22) +
+  theme(
+    axis.line    = element_line(linewidth = 0.9, color = "black"),
+    axis.text.y  = element_text(size = 18),
+    axis.title.y = element_text(size = 20),
+    axis.text.x  = element_text(size = 20, angle = 0, hjust = 0.5),
+    axis.title.x = element_text(size = 18),
+    plot.title   = element_text(size = 16, hjust = 0.5),
+    legend.position = "none"
+  )
+
+ggsave(
+  "HullArea_MDAMB231_Box_Seg_vs_Clus.png",
+  p_box,
+  width  = 6,
+  height = 6,
+  dpi    = 600
+)
+
+p_box
+```
+
+
+### 3.) Track Length
+```{r}
+## 1) Numeric coords + sort (match your parsing style)
+CP_num_len <- Combined_Positions %>%
+  dplyr::mutate(
+    TimeNum = suppressWarnings(readr::parse_number(Time)),
+    X       = suppressWarnings(readr::parse_number(X_Position)),
+    Y       = suppressWarnings(readr::parse_number(Y_Position))
+  ) %>%
+  dplyr::filter(is.finite(TimeNum), is.finite(X), is.finite(Y)) %>%
+  dplyr::arrange(SampleID, UniqueID, TimeNum)
+
+## 2) Track length per track (UniqueID)
+TrackLengths <- CP_num_len %>%
+  dplyr::group_by(SampleID, UniqueID, Group, CellTypeID) %>%
+  dplyr::summarise(
+    TrackLength = {
+      x <- X
+      y <- Y
+      ok <- complete.cases(x, y)
+      x <- x[ok]; y <- y[ok]
+      if (length(x) < 2) {
+        NA_real_
+      } else {
+        sum(sqrt(diff(x)^2 + diff(y)^2))
+      }
+    },
+    n_points = sum(complete.cases(X, Y)),
+    .groups = "drop"
+  )
+
+## 3) Restrict to your 2 cell types + your 2 groups
+df_len <- TrackLengths %>%
+  dplyr::filter(
+    CellTypeID %in% c("MDAMB231", "Myoepithelial"),
+    Group %in% c("Segregated", "Clustered"),
+    !is.na(TrackLength)
+  ) %>%
+  dplyr::mutate(
+    Group      = factor(Group, levels = c("Segregated", "Clustered")),
+    CellTypeID = factor(CellTypeID, levels = c("MDAMB231", "Myoepithelial"))
+  )
+```
+
+#### Stats
+```{r}
+welch_tracklength_by_celltype <- function(df) {
+
+  star_from_p <- function(p) {
+    if (is.na(p)) return(NA_character_)
+    if (p <= 0.0001) return("****")
+    if (p <= 0.001)  return("***")
+    if (p <= 0.01)   return("**")
+    if (p <= 0.05)   return("*")
+    "ns"
+  }
+
+  df %>%
+    dplyr::group_by(CellTypeID) %>%
+    dplyr::group_modify(function(d, key) {
+
+      d <- d %>%
+        tidyr::drop_na(TrackLength, Group) %>%
+        dplyr::mutate(Group = factor(Group, levels = c("Segregated", "Clustered")))
+
+      # require both groups + >=2 tracks per group
+      if (dplyr::n_distinct(d$Group) < 2 || any(table(d$Group) < 2)) {
+        return(tibble::tibble(
+          comparison = "Segregated-Clustered",
+          direction  = NA_character_,
+          p_value    = NA_real_,
+          sig        = NA_character_,
+          statement  = paste0(as.character(key$CellTypeID), ": Not enough tracks in one group")
+        ))
+      }
+
+      tt <- t.test(TrackLength ~ Group, data = d, var.equal = FALSE)
+      p  <- tt$p.value
+
+      means <- tapply(d$TrackLength, d$Group, mean, na.rm = TRUE)
+      dir_txt <- if (means["Clustered"] > means["Segregated"]) "Clustered > Segregated" else "Segregated > Clustered"
+
+      tibble::tibble(
+        comparison = "Segregated-Clustered",
+        direction  = dir_txt,
+        p_value    = p,
+        sig        = star_from_p(p),
+        statement  = paste0(
+          as.character(key$CellTypeID),
+          " TrackLength: ", dir_txt,
+          " (Welch t-test, p = ", signif(p, 3), ", ", star_from_p(p), ")"
+        )
+      )
+    }) %>%
+    dplyr::ungroup()
+}
+
+tracklen_pairwise <- welch_tracklength_by_celltype(df_len)
+
+tracklen_pairwise
+tracklen_pairwise$statement
+```
+
+
+#### Viz
+```{r}
+fill_cols  <- group_colors
+point_cols <- point_colors
+
+data_max <- max(df_len$TrackLength, na.rm = TRUE)
+step <- if (data_max <= 2000) 250 else 500
+
+sig_rows <- tracklen_pairwise %>%
+  dplyr::filter(!is.na(sig), sig != "ns") %>%
+  dplyr::mutate(
+    group1 = "Segregated",
+    group2 = "Clustered"
+  )
+
+ymax_ceil <- ceiling(data_max / step) * step
+base_y <- ymax_ceil * 0.80
+step_y <- ymax_ceil * 0.08
+
+stat_df_len <- sig_rows %>%
+  dplyr::group_by(CellTypeID) %>%
+  dplyr::mutate(
+    y.position = base_y + step_y * (dplyr::row_number() - 1),
+    label      = sig
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(CellTypeID, group1, group2, y.position, label)
+
+bracket_max <- if (nrow(stat_df_len) > 0) max(stat_df_len$y.position, na.rm = TRUE) else 0
+
+# probe violin ymax so brackets never get clipped
+p_probe_len <- ggplot(df_len, aes(x = Group, y = TrackLength)) +
+  geom_violin(trim = FALSE, width = 0.95)
+
+violin_max_len <- max(ggplot_build(p_probe_len)$data[[1]]$ymax, na.rm = TRUE)
+ylim_top_len <- max(violin_max_len, bracket_max) * 1.05
+
+ymax_break <- ceiling(ylim_top_len / step) * step
+y_breaks   <- seq(0, ymax_break, by = step)
+
+p_len <- ggplot(df_len, aes(x = Group, y = TrackLength)) +
+  geom_violin(
+    aes(fill = Group),
+    trim  = FALSE,
+    alpha = 0.35,
+    color = NA,
+    width = 0.95
+  ) +
+  geom_boxplot(
+    aes(fill = Group),
+    width         = 0.22,
+    outlier.shape = NA,
+    alpha         = 0.85,
+    linewidth     = 0.8
+  ) +
+  geom_jitter(
+    aes(color = Group),
+    width = 0.15,
+    size  = 2,
+    alpha = 0.8,
+    show.legend = FALSE
+  ) +
+  facet_grid(. ~ CellTypeID) +
+  scale_fill_manual(values = fill_cols, drop = FALSE) +
+  scale_color_manual(values = point_cols, drop = FALSE) +
+  scale_y_continuous(breaks = y_breaks, expand = c(0, 0)) +
+  scale_x_discrete(labels = c("Segregated" = "Segregated", "Clustered" = "Clustered")) +
+  coord_cartesian(ylim = c(0, ylim_top_len)) +
+  {
+    if (nrow(stat_df_len) > 0) {
+      ggpubr::stat_pvalue_manual(
+        stat_df_len,
+        xmin = "group1",
+        xmax = "group2",
+        label = "label",
+        y.position = "y.position",
+        tip.length   = 0.03,
+        size         = 6,
+        bracket.size = 0.9
+      )
+    } else {
+      NULL
+    }
+  } +
+  labs(
+    title = NULL,
+    x     = "Spatial Arrangement",
+    y     = "Total Distance Traveled (µm)"
+  ) +
+  theme_classic(base_size = 20) +
+  theme(
+    axis.line    = element_line(linewidth = 0.9, color = "black"),
+    axis.text.y  = element_text(size = 18),
+    axis.title.y = element_text(size = 20),
+    axis.text.x  = element_text(size = 15, hjust = 0.5),
+    axis.title.x = element_text(size = 14),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text.x = element_text(size = 20),
+    panel.spacing.x = unit(1.5, "lines")
+  )
+
+ggsave(
+  filename = "TrackLength_Seg_Clus.png",
+  plot     = p_len,
+  width    = 6.5,
+  height   = 4.7,
+  dpi      = 600
+)
+
+p_len
+```
+
+
+### 4.) Normalized Distance (Distance ÷ Frames) Accounts for tracks truncated from cell divisions and cells that go out of frame.
+```{r}
+CP_num_dist <- Combined_Positions %>%
+  mutate(
+    TimeNum = suppressWarnings(readr::parse_number(Time)),
+    X       = suppressWarnings(readr::parse_number(X_Position)),
+    Y       = suppressWarnings(readr::parse_number(Y_Position))
+  ) %>%
+  filter(is.finite(TimeNum), is.finite(X), is.finite(Y)) %>%
+  arrange(SampleID, UniqueID, TimeNum)
+
+# 2) Distance per frame (normalizes for divisions / out-of-frame)
+DistPerFrame_df <- CP_num_dist %>%
+  filter(
+    CellTypeID %in% c("MDAMB231", "Myoepithelial"),
+    Group %in% c("Segregated", "Clustered")
+  ) %>%
+  group_by(SampleID, UniqueID, Group, CellTypeID) %>%
+  summarise(
+    n_frames_visible = n(),
+
+    TrackLength = {
+      x <- X
+      y <- Y
+      if (length(x) < 2) NA_real_ else sum(sqrt(diff(x)^2 + diff(y)^2))
+    },
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(TrackLength), n_frames_visible >= 2) %>%
+  mutate(
+    Group = factor(Group, levels = c("Segregated", "Clustered")),
+    CellTypeID = factor(CellTypeID, levels = c("MDAMB231", "Myoepithelial")),
+    Dist_um_per_frame = TrackLength / (n_frames_visible - 1)
+  )
+
+df_dist_frame <- DistPerFrame_df
+
+# sanity
+summary(df_dist_frame$Dist_um_per_frame)
+```
+
+#### Stats
+```{r}
+welch_distframe_by_celltype <- function(df) {
+
+  star_from_p <- function(p) {
+    if (is.na(p)) return(NA_character_)
+    if (p <= 0.0001) return("****")
+    if (p <= 0.001)  return("***")
+    if (p <= 0.01)   return("**")
+    if (p <= 0.05)   return("*")
+    "ns"
+  }
+
+  df %>%
+    group_by(CellTypeID) %>%
+    group_modify(function(d, key) {
+
+      d <- d %>%
+        tidyr::drop_na(Dist_um_per_frame, Group) %>%
+        mutate(Group = factor(Group, levels = c("Segregated", "Clustered")))
+
+      # require both groups + >=2 tracks per group
+      if (n_distinct(d$Group) < 2 || any(table(d$Group) < 2)) {
+        return(tibble(
+          comparison = "Segregated-Clustered",
+          direction  = NA_character_,
+          p_value    = NA_real_,
+          sig        = NA_character_,
+          statement  = paste0(as.character(key$CellTypeID), ": Not enough tracks in one group")
+        ))
+      }
+
+      tt <- t.test(Dist_um_per_frame ~ Group, data = d, var.equal = FALSE)
+      p  <- tt$p.value
+
+      means <- tapply(d$Dist_um_per_frame, d$Group, mean, na.rm = TRUE)
+      dir_txt <- if (means["Clustered"] > means["Segregated"]) {
+        "Clustered > Segregated"
+      } else {
+        "Segregated > Clustered"
+      }
+
+      tibble(
+        comparison = "Segregated-Clustered",
+        direction  = dir_txt,
+        p_value    = p,
+        sig        = star_from_p(p),
+        statement  = paste0(
+          as.character(key$CellTypeID),
+          " Distance/frame: ", dir_txt,
+          " (Welch t-test, p = ", signif(p, 3), ", ", star_from_p(p), ")"
+        )
+      )
+    }) %>%
+    ungroup()
+}
+
+dist_frame_pairwise <- welch_distframe_by_celltype(df_dist_frame)
+
+dist_frame_pairwise
+dist_frame_pairwise$statement
+```
+
+#### Viz
+```{r}
+fill_cols  <- group_colors
+point_cols <- point_colors
+
+if (nrow(df_dist_frame) == 0) {
+  stop("df_dist_frame is empty. Check Group / CellTypeID filtering upstream.")
+}
+
+sig_rows <- dist_frame_pairwise %>%
+  filter(!is.na(sig), sig != "ns") %>%
+  mutate(group1 = "Segregated", group2 = "Clustered")
+
+# --- FIXED AXIS RANGE ---
+ylim_top  <- 18
+y_breaks  <- seq(0, 18, by = 2.5)
+
+# bracket height (kept relative but capped inside axis)
+stat_df_dist <- sig_rows %>%
+  group_by(CellTypeID) %>%
+  mutate(
+    data_max   = max(df_dist_frame$Dist_um_per_frame[df_dist_frame$CellTypeID == CellTypeID[1]], na.rm = TRUE),
+    y.position = pmin(data_max * 1.10, 17.2),
+    label      = sig
+  ) %>%
+  ungroup() %>%
+  select(CellTypeID, group1, group2, y.position, label)
+
+p_dist_frame <- ggplot(df_dist_frame, aes(x = Group, y = Dist_um_per_frame)) +
+  geom_violin(aes(fill = Group), trim = FALSE, alpha = 0.35, color = NA, width = 0.95) +
+  geom_boxplot(aes(fill = Group), width = 0.22, outlier.shape = NA, alpha = 0.85, linewidth = 0.8) +
+  geom_jitter(aes(color = Group), width = 0.15, size = 2, alpha = 0.8, show.legend = FALSE) +
+  facet_grid(. ~ CellTypeID) +
+  scale_fill_manual(values = fill_cols, drop = FALSE) +
+  scale_color_manual(values = point_cols, drop = FALSE) +
+  scale_x_discrete(labels = c("Segregated" = "Segregated", "Clustered" = "Clustered")) +
+  scale_y_continuous(breaks = y_breaks, limits = c(0, 18), expand = c(0, 0)) +
+  coord_cartesian(clip = "off") +
+  {
+    if (nrow(stat_df_dist) > 0) {
+      ggpubr::stat_pvalue_manual(
+        stat_df_dist,
+        xmin = "group1",
+        xmax = "group2",
+        label = "label",
+        y.position = "y.position",
+        tip.length = 0.03,
+        size = 14,
+        bracket.size = 0.9
+      )
+    } else NULL
+  } +
+  labs(
+    title = NULL,
+    x     = "Spatial Arrangement",
+    y     = "Normalized Distance \nTraveled (µm / Frame)"
+  ) +
+  theme_classic(base_size = 20) +
+  theme(
+    axis.line    = element_line(linewidth = 0.9, color = "black"),
+    axis.text.y  = element_text(size = 18),
+    axis.title.y = element_text(size = 20),
+    axis.text.x  = element_text(size = 16, hjust = 0.5),
+    axis.title.x = element_text(size = 16),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text.x = element_text(size = 20),
+    panel.spacing.x = unit(2, "lines"),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+ggsave(
+  "DistancePerVisibleFrame_Seg_Clus.png",
+  p_dist_frame,
+  width  = 7,
+  height = 5,
+  dpi    = 600
+)
+
+p_dist_frame
+```
+
+### 5.) Net Displacement
+```{r}
+fill_cols  <- group_colors
+point_cols <- point_colors
+
+disp_df <- Combined_Positions %>%
+  mutate(
+    TimeNum = suppressWarnings(readr::parse_number(as.character(Time))),
+    X       = suppressWarnings(readr::parse_number(as.character(X_Position))),
+    Y       = suppressWarnings(readr::parse_number(as.character(Y_Position)))
+  ) %>%
+  filter(
+    is.finite(TimeNum), is.finite(X), is.finite(Y),
+    Group %in% c("Segregated", "Clustered"),
+    CellTypeID %in% c("MDAMB231", "Myoepithelial"),
+    CellTypeID != "Missing_ID"
+  ) %>%
+  arrange(SampleID, UniqueID, TimeNum) %>%
+  group_by(SampleID, UniqueID) %>%
+  summarise(
+    Group      = first(Group),
+    CellTypeID = first(CellTypeID),
+
+    # sanity checks (drop broken tracks)
+    group_n    = n_distinct(Group),
+    celltype_n = n_distinct(CellTypeID),
+
+    x0 = first(X),
+    y0 = first(Y),
+    x1 = last(X),
+    y1 = last(Y),
+
+    Displacement_um = sqrt((x1 - x0)^2 + (y1 - y0)^2),
+    n_points = n(),
+    .groups = "drop"
+  ) %>%
+  filter(group_n == 1, celltype_n == 1, n_points >= 2) %>%
+  select(-group_n, -celltype_n) %>%
+  mutate(
+    Group      = factor(Group, levels = c("Segregated", "Clustered")),
+    CellTypeID = factor(CellTypeID, levels = c("MDAMB231", "Myoepithelial"))
+  )
+
+# optional: quick counts
+disp_df %>% count(CellTypeID, Group)
+```
+
+#### Stats
+```{r}
+welch_displacement_by_celltype <- function(df) {
+
+  star_from_p <- function(p) {
+    if (is.na(p)) return(NA_character_)
+    if (p <= 0.0001) return("****")
+    if (p <= 0.001)  return("***")
+    if (p <= 0.01)   return("**")
+    if (p <= 0.05)   return("*")
+    "ns"
+  }
+
+  df %>%
+    group_by(CellTypeID) %>%
+    group_modify(function(d, key) {
+
+      d <- d %>%
+        tidyr::drop_na(Displacement_um, Group) %>%
+        mutate(Group = factor(Group, levels = c("Segregated", "Clustered")))
+
+      # require both groups + >=2 tracks per group
+      if (n_distinct(d$Group) < 2 || any(table(d$Group) < 2)) {
+        return(tibble(
+          comparison = "Segregated-Clustered",
+          direction  = NA_character_,
+          p_value    = NA_real_,
+          sig        = NA_character_,
+          statement  = paste0(as.character(key$CellTypeID), ": Not enough tracks in one group")
+        ))
+      }
+
+      tt <- t.test(Displacement_um ~ Group, data = d, var.equal = FALSE)
+      p  <- tt$p.value
+
+      means <- tapply(d$Displacement_um, d$Group, mean, na.rm = TRUE)
+      dir_txt <- if (means["Clustered"] > means["Segregated"]) {
+        "Clustered > Segregated"
+      } else {
+        "Segregated > Clustered"
+      }
+
+      tibble(
+        comparison = "Segregated-Clustered",
+        direction  = dir_txt,
+        p_value    = p,
+        sig        = star_from_p(p),
+        statement  = paste0(
+          as.character(key$CellTypeID),
+          " Net Displacement: ", dir_txt,
+          " (Welch t-test, p = ", signif(p, 3), ", ", star_from_p(p), ")"
+        )
+      )
+    }) %>%
+    ungroup()
+}
+
+disp_pairwise <- welch_displacement_by_celltype(disp_df)
+
+disp_pairwise
+disp_pairwise$statement
+```
+
+#### Viz
+```{r}
+sig_rows <- disp_pairwise %>%
+  filter(!is.na(sig), sig != "ns") %>%
+  mutate(group1 = "Segregated", group2 = "Clustered")
+
+data_max <- max(disp_df$Displacement_um, na.rm = TRUE)
+step <- if (data_max <= 500) 50 else if (data_max <= 1000) 100 else if (data_max <= 2000) 250 else 500
+
+ymax_ceil <- ceiling(data_max / step) * step
+
+# bracket heights per facet (not hard-coded; stays above the data)
+stat_df_disp <- sig_rows %>%
+  group_by(CellTypeID) %>%
+  mutate(
+    data_max_ct = max(disp_df$Displacement_um[disp_df$CellTypeID == CellTypeID[1]], na.rm = TRUE),
+    y.position  = data_max_ct * 1.3,
+    label       = sig
+  ) %>%
+  ungroup() %>%
+  select(CellTypeID, group1, group2, y.position, label)
+
+ylim_top <- if (nrow(stat_df_disp) > 0) {
+  max(stat_df_disp$y.position, na.rm = TRUE) * 1.05
+} else {
+  ymax_ceil * 1.10
+}
+
+ymax_break <- ceiling(ylim_top / step) * step
+y_breaks   <- seq(0, ymax_break, by = step)
+
+p_disp <- ggplot(disp_df, aes(x = Group, y = Displacement_um)) +
+  geom_violin(aes(fill = Group), trim = FALSE, alpha = 0.35, color = NA, width = 0.95) +
+  geom_boxplot(aes(fill = Group), width = 0.22, outlier.shape = NA, alpha = 0.85, linewidth = 0.8) +
+  geom_jitter(aes(color = Group), width = 0.15, size = 2, alpha = 0.8, show.legend = FALSE) +
+  facet_grid(. ~ CellTypeID) +
+  scale_fill_manual(values = fill_cols, drop = FALSE) +
+  scale_color_manual(values = point_cols, drop = FALSE) +
+  scale_x_discrete(labels = c("Segregated" = "Segregated", "Clustered" = "Clustered")) +
+  scale_y_continuous(breaks = y_breaks, expand = expansion(mult = c(0, 0.02))) +
+  coord_cartesian(ylim = c(0, ylim_top), clip = "off") +
+  {
+    if (nrow(stat_df_disp) > 0) {
+      ggpubr::stat_pvalue_manual(
+        stat_df_disp,
+        xmin = "group1",
+        xmax = "group2",
+        label = "label",
+        y.position = "y.position",
+        tip.length = 0.03,
+        size = 12,
+        bracket.size = 0.9
+      )
+    } else NULL
+  } +
+  labs(
+    title = NULL,
+    x = "Spatial Arrangement",
+    y = "Net Displacement (µm)"
+  ) +
+  theme_classic(base_size = 20) +
+  theme(
+    axis.line    = element_line(linewidth = 0.9, color = "black"),
+    axis.text.y  = element_text(size = 18),
+    axis.title.y = element_text(size = 20),
+    axis.text.x  = element_text(size = 15, angle = 0, hjust = 0.5),
+    axis.title.x = element_text(size = 14),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text.x = element_text(size = 20),
+    panel.spacing.x = unit(1.5, "lines"),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+ggsave(
+  filename = "NetDisplacement_Seg_Clus.png",
+  plot     = p_disp,
+  width    = 6.5,
+  height   = 4.7,
+  dpi      = 600
+)
+
+p_disp
+```
+
+### 6.) MSD
+```{r}
+frame_interval_min <- 10
+
+prep_tracks_msd <- function(df) {
+  df %>%
+    dplyr::mutate(
+      TimeNum = suppressWarnings(readr::parse_number(as.character(Time))),
+      X       = suppressWarnings(readr::parse_number(as.character(X_Position))),
+      Y       = suppressWarnings(readr::parse_number(as.character(Y_Position)))
+    ) %>%
+    dplyr::filter(is.finite(TimeNum), is.finite(X), is.finite(Y)) %>%
+    dplyr::arrange(UniqueID, TimeNum) %>%
+    dplyr::distinct(UniqueID, TimeNum, .keep_all = TRUE)
+}
+
+msd_per_track <- function(track_df) {
+  x <- track_df$X
+  y <- track_df$Y
+  n <- length(x)
+  if (n < 2) return(tibble::tibble(tau_frames = integer(), msd_track = numeric()))
+
+  k_vec <- seq_len(n - 1)
+  msd_k <- vapply(k_vec, function(k) {
+    dx <- x[(1 + k):n] - x[1:(n - k)]
+    dy <- y[(1 + k):n] - y[1:(n - k)]
+    mean(dx*dx + dy*dy, na.rm = TRUE)
+  }, numeric(1))
+
+  tibble::tibble(tau_frames = k_vec, msd_track = msd_k)
+}
+
+calc_msd_unbalanced <- function(df, frame_interval_min = 10, min_tracks_for_sem = 3) {
+  df <- df %>%
+    prep_tracks_msd() %>%
+    dplyr::group_by(UniqueID) %>%
+    dplyr::arrange(TimeNum, .by_group = TRUE)
+
+  if (nrow(df) == 0) {
+    return(tibble::tibble(
+      tau_frames = integer(),
+      tau_min    = numeric(),
+      tau_hr     = numeric(),
+      msd        = numeric(),
+      sem        = numeric(),
+      n_tracks   = integer()
+    ))
+  }
+
+  per_track <- df %>%
+    dplyr::group_split(UniqueID, .keep = FALSE) %>%
+    purrr::map_dfr(msd_per_track, .id = "track_index")
+
+  per_track %>%
+    dplyr::group_by(tau_frames) %>%
+    dplyr::summarise(
+      msd      = mean(msd_track, na.rm = TRUE),
+      sem      = sd(msd_track, na.rm = TRUE) / sqrt(sum(is.finite(msd_track))),
+      n_tracks = sum(is.finite(msd_track)),
+      .groups  = "drop"
+    ) %>%
+    dplyr::mutate(
+      tau_min = tau_frames * frame_interval_min,
+      tau_hr  = tau_min / 60,
+      sem     = ifelse(n_tracks >= min_tracks_for_sem, sem, NA_real_)
+    ) %>%
+    dplyr::arrange(tau_frames)
+}
+
+compute_msd_by_celltype <- function(dat,
+                                    celltype,
+                                    groups = c("Segregated", "Clustered"),
+                                    frame_interval_min = 10,
+                                    min_tracks_for_sem = 3) {
+  purrr::map_dfr(groups, function(g) {
+    subset_df <- dat %>%
+      dplyr::filter(CellTypeID == celltype, Group == g, CellTypeID != "Missing_ID") %>%
+      dplyr::select(UniqueID, Time, X_Position, Y_Position)
+
+    out <- calc_msd_unbalanced(
+      subset_df,
+      frame_interval_min = frame_interval_min,
+      min_tracks_for_sem = min_tracks_for_sem
+    )
+    out$Group      <- g
+    out$CellTypeID <- celltype
+    out
+  })
+}
+
+trim_to_common_tau <- function(summary_df, groups = c("Segregated", "Clustered")) {
+  df <- summary_df %>% dplyr::filter(Group %in% groups)
+
+  max_tau_by_group <- df %>%
+    dplyr::group_by(CellTypeID, Group) %>%
+    dplyr::summarise(
+      max_tau = max(tau_frames[n_tracks >= 1], na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  common_tau_by_ct <- max_tau_by_group %>%
+    dplyr::group_by(CellTypeID) %>%
+    dplyr::summarise(common_tau = min(max_tau, na.rm = TRUE), .groups = "drop")
+
+  df %>%
+    dplyr::left_join(common_tau_by_ct, by = "CellTypeID") %>%
+    dplyr::filter(is.finite(common_tau), tau_frames <= common_tau) %>%
+    dplyr::select(-common_tau)
+}
+
+# --- Compute MSD summaries (Segregated first, Clustered second) ---
+msd_mda <- compute_msd_by_celltype(
+  Combined_Positions,
+  celltype = "MDAMB231",
+  groups = c("Segregated", "Clustered"),
+  frame_interval_min = frame_interval_min,
+  min_tracks_for_sem = 3
+)
+
+msd_myo <- compute_msd_by_celltype(
+  Combined_Positions,
+  celltype = "Myoepithelial",
+  groups = c("Segregated", "Clustered"),
+  frame_interval_min = frame_interval_min,
+  min_tracks_for_sem = 3
+)
+
+msd_all <- dplyr::bind_rows(msd_mda, msd_myo) %>%
+  dplyr::mutate(
+    Group      = factor(Group, levels = c("Segregated", "Clustered")),
+    CellTypeID = factor(CellTypeID, levels = c("MDAMB231", "Myoepithelial"))
+  )
+
+# Trim so Segregated and Clustered have identical x-range within each facet
+msd_all_trim <- trim_to_common_tau(msd_all, groups = c("Segregated", "Clustered"))
+
+# y-limit based on observed (msd + sem)
+y_max <- max(msd_all_trim$msd + ifelse(is.finite(msd_all_trim$sem), msd_all_trim$sem, 0), na.rm = TRUE)
+y_max <- ceiling(y_max / 1000) * 1000
+
+# Ribbon only where SEM exists
+msd_ribbon <- msd_all_trim %>% dplyr::filter(is.finite(sem))
+
+# Nice x breaks in hours (every 6 h, up to max)
+xmax_hr <- max(msd_all_trim$tau_hr, na.rm = TRUE)
+x_breaks_hr <- seq(0, ceiling(xmax_hr / 6) * 6, by = 6)
+
+# --- Plot ---
+p_msd <- ggplot(msd_all_trim, aes(x = tau_hr, y = msd, color = Group, fill = Group)) +
+  geom_ribbon(
+    data = msd_ribbon,
+    aes(ymin = pmax(msd - sem, 0), ymax = msd + sem),
+    alpha = 0.18,
+    color = NA
+  ) +
+  geom_line(linewidth = 0.9, na.rm = TRUE) +
+  geom_point(size = 0.5, alpha = 0.6, na.rm = TRUE) +
+  facet_grid(. ~ CellTypeID) +
+  scale_color_manual(
+    values = group_colors,
+    breaks = c("Segregated", "Clustered"),
+    labels = c("Segregated", "Clustered"),
+    name   = "Spatial\nArrangement",
+    drop   = FALSE
+  ) +
+  scale_fill_manual(
+    values = group_colors,
+    breaks = c("Segregated", "Clustered"),
+    labels = c("Segregated", "Clustered"),
+    name   = "Spatial\nArrangement",
+    drop   = FALSE
+  ) +
+  scale_x_continuous(
+    limits = c(0, NA),
+    breaks = x_breaks_hr,
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(limits = c(0, 200000), expand = expansion(mult = c(0, 0.02))) +
+  labs(
+    title = NULL,
+    x = "Lag τ (hours)",
+    y = expression("MSD ("*mu*"m"^2*")")
+  ) +
+  theme_classic(base_size = 22) +
+  theme(
+    legend.position  = "right",
+    legend.title = element_text(size = 18, margin = margin(b = 4)),
+    legend.text = element_text(size = 16),
+    legend.key.height = unit(10, "pt"),
+    legend.spacing.y  = unit(2, "pt"),
+    strip.background = element_blank(),
+    strip.text.x     = element_text(size = 24),
+    axis.line        = element_line(linewidth = 1.2, color = "black"),
+    axis.text        = element_text(size = 22),
+    axis.title       = element_text(size = 24),
+    panel.spacing.x  = grid::unit(2, "cm")
+  )
+
+ggsave(
+  filename = "MSD_Segregated_Clustered_MDAMB231_Myo_sharedY.png",
+  plot     = p_msd,
+  width    = 12.5,
+  height   = 6,
+  dpi      = 600
+)
+
+p_msd
+```
+
+#### Alpha calculation
+```{r}
+fit_range_hr <- c(0.83, 8.33)   # 50 to 500 minutes expressed in hours
+
+get_alpha <- function(df,
+                      tau_col = "tau_hr",
+                      msd_col = "msd",
+                      tau_range = c(0.83, 8.33),
+                      min_pts = 3) {
+
+  stopifnot(tau_col %in% names(df), msd_col %in% names(df))
+
+  df_filt <- df %>%
+    dplyr::filter(
+      is.finite(.data[[tau_col]]),
+      .data[[tau_col]] >= tau_range[1],
+      .data[[tau_col]] <= tau_range[2],
+      is.finite(.data[[msd_col]]),
+      .data[[msd_col]] > 0
+    ) %>%
+    dplyr::mutate(
+      log_tau = log(.data[[tau_col]]),
+      log_msd = log(.data[[msd_col]])
+    )
+
+  if (nrow(df_filt) == 0) {
+    return(tibble::tibble(
+      CellTypeID = character(),
+      Group      = character(),
+      n_pts      = integer(),
+      alpha      = numeric(),
+      r2         = numeric()
+    ))
+  }
+
+  df_filt %>%
+    dplyr::group_by(CellTypeID, Group) %>%
+    tidyr::nest() %>%
+    dplyr::mutate(
+      n_pts  = purrr::map_int(data, nrow),
+      model  = purrr::map(data, ~ if (nrow(.x) >= min_pts) stats::lm(log_msd ~ log_tau, data = .x) else NULL),
+      alpha  = purrr::map_dbl(model, ~ if (is.null(.x)) NA_real_ else unname(stats::coef(.x)[2])),
+      r2     = purrr::map_dbl(model, ~ if (is.null(.x)) NA_real_ else summary(.x)$r.squared)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      Group = factor(Group, levels = c("Segregated", "Clustered"))
+    ) %>%
+    dplyr::arrange(CellTypeID, Group) %>%
+    dplyr::select(CellTypeID, Group, n_pts, alpha, r2)
+}
+
+alpha_results <- get_alpha(
+  msd_all_trim,
+  tau_col   = "tau_hr",
+  msd_col   = "msd",
+  tau_range = fit_range_hr,
+  min_pts   = 3
+)
+
+alpha_results %>%
+  dplyr::mutate(
+    alpha = sprintf("%.2f", alpha),
+    r2    = sprintf("%.2f", r2)
+  )
+
+```
+
+
+### 7.) Travel consistency
+```{r}
+# Travel consistency is net displacement / track length
+
+# Build displacement df (we already have but if future code doesn't have here is how to do it )
+if (!exists("disp_df")) {
+
+  disp_df <- Combined_Positions %>%
+    mutate(
+      TimeNum = suppressWarnings(readr::parse_number(as.character(Time))),
+      X       = suppressWarnings(readr::parse_number(as.character(X_Position))),
+      Y       = suppressWarnings(readr::parse_number(as.character(Y_Position)))
+    ) %>%
+    filter(
+      is.finite(TimeNum), is.finite(X), is.finite(Y),
+      Group %in% c("Segregated", "Clustered"),
+      CellTypeID %in% c("MDAMB231", "Myoepithelial"),
+      CellTypeID != "Missing_ID"
+    ) %>%
+    arrange(SampleID, UniqueID, TimeNum) %>%
+    group_by(SampleID, UniqueID) %>%
+    summarise(
+      Group      = first(Group),
+      CellTypeID = first(CellTypeID),
+      group_n    = n_distinct(Group),
+      celltype_n = n_distinct(CellTypeID),
+      x0 = first(X), y0 = first(Y),
+      x1 = last(X),  y1 = last(Y),
+      Displacement_um = sqrt((x1 - x0)^2 + (y1 - y0)^2),
+      n_points = n(),
+      .groups = "drop"
+    ) %>%
+    filter(group_n == 1, celltype_n == 1, n_points >= 2) %>%
+    select(-group_n, -celltype_n, -n_points) %>%
+    mutate(
+      Group      = factor(Group, levels = c("Segregated", "Clustered")),
+      CellTypeID = factor(CellTypeID, levels = c("MDAMB231", "Myoepithelial"))
+    )
+}
+
+disp_df_use <- disp_df %>%
+  filter(
+    Group %in% c("Segregated", "Clustered"),
+    CellTypeID %in% c("MDAMB231", "Myoepithelial"),
+    is.finite(Displacement_um),
+    Displacement_um >= 0
+  ) %>%
+  mutate(
+    Group      = factor(Group, levels = c("Segregated", "Clustered")),
+    CellTypeID = factor(CellTypeID, levels = c("MDAMB231", "Myoepithelial"))
+  )
+
+# Build track length df (we already have but if future code doesn't have here is how to do it )
+if (!exists("TrackLengths")) {
+
+  CP_num_len <- Combined_Positions %>%
+    mutate(
+      TimeNum = suppressWarnings(readr::parse_number(Time)),
+      X       = suppressWarnings(readr::parse_number(X_Position)),
+      Y       = suppressWarnings(readr::parse_number(Y_Position))
+    ) %>%
+    filter(is.finite(TimeNum), is.finite(X), is.finite(Y)) %>%
+    arrange(SampleID, UniqueID, TimeNum)
+
+  TrackLengths <- CP_num_len %>%
+    group_by(SampleID, UniqueID, Group, CellTypeID) %>%
+    summarise(
+      TrackLength = {
+        x <- X; y <- Y
+        ok <- complete.cases(x, y)
+        x <- x[ok]; y <- y[ok]
+        if (length(x) < 2) NA_real_ else sum(sqrt(diff(x)^2 + diff(y)^2))
+      },
+      n_points = sum(complete.cases(X, Y)),
+      .groups = "drop"
+    )
+}
+
+TrackLengths_use <- TrackLengths %>%
+  filter(
+    Group %in% c("Segregated", "Clustered"),
+    CellTypeID %in% c("MDAMB231", "Myoepithelial"),
+    CellTypeID != "Missing_ID",
+    is.finite(TrackLength),
+    TrackLength > 0
+  ) %>%
+  mutate(
+    Group      = factor(Group, levels = c("Segregated", "Clustered")),
+    CellTypeID = factor(CellTypeID, levels = c("MDAMB231", "Myoepithelial"))
+  )
+
+# Merge + compute CI
+CI_df <- TrackLengths_use %>%
+  inner_join(
+    disp_df_use %>% select(SampleID, UniqueID, Group, CellTypeID, Displacement_um),
+    by = c("SampleID", "UniqueID", "Group", "CellTypeID")
+  ) %>%
+  mutate(
+    CI = if_else(
+      is.finite(TrackLength) & TrackLength > 0 &
+        is.finite(Displacement_um) & Displacement_um >= 0,
+      Displacement_um / TrackLength,
+      NA_real_
+    )
+  ) %>%
+  filter(is.finite(CI)) %>%
+  mutate(
+    CI = pmin(pmax(CI, 0), 1), # clamp tiny numerical overshoots
+    Group      = factor(Group, levels = c("Segregated", "Clustered")),
+    CellTypeID = factor(CellTypeID, levels = c("MDAMB231", "Myoepithelial"))
+  )
+
+# sanity
+CI_df %>% count(CellTypeID, Group)
+summary(CI_df$CI)
+```
+
+#### Stats
+```{r}
+pairwise_ci_by_celltype <- function(df) {
+
+  df %>%
+    group_by(CellTypeID) %>%
+    group_modify(function(d, key) {
+
+      d <- d %>%
+        tidyr::drop_na(CI, Group) %>%
+        mutate(Group = factor(Group, levels = c("Segregated", "Clustered")))
+
+      # require both groups + >=2 tracks per group
+      if (n_distinct(d$Group) < 2 || any(table(d$Group) < 2)) {
+        return(tibble(
+          comparison = "Segregated-Clustered",
+          direction  = NA_character_,
+          p_value    = NA_real_,
+          sig        = NA_character_,
+          statement  = paste0(as.character(key$CellTypeID), ": Not enough tracks in one group")
+        ))
+      }
+
+      tt <- t.test(CI ~ Group, data = d, var.equal = FALSE)
+      p  <- tt$p.value
+
+      means <- tapply(d$CI, d$Group, mean, na.rm = TRUE)
+      dir_txt <- if (means["Clustered"] > means["Segregated"]) {
+        "Clustered > Segregated"
+      } else {
+        "Segregated > Clustered"
+      }
+
+      tibble(
+        comparison = "Segregated-Clustered",
+        direction  = dir_txt,
+        p_value    = p,
+        sig        = star_from_p(p),
+        statement  = paste0(
+          as.character(key$CellTypeID),
+          " Travel Consistency: ", dir_txt,
+          " (Welch t-test, p = ", signif(p, 3), ", ", star_from_p(p), ")"
+        )
+      )
+    }) %>%
+    ungroup()
+}
+
+ci_pairwise <- pairwise_ci_by_celltype(CI_df)
+
+ci_pairwise
+ci_pairwise$statement
+```
+
+#### Viz
+```{r}
+fill_cols  <- group_colors
+point_cols <- point_colors
+
+star_from_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p <= 0.0001) return("****")
+  if (p <= 0.001)  return("***")
+  if (p <= 0.01)   return("**")
+  if (p <= 0.05)   return("*")
+  "ns"
+}
+
+sig_rows <- ci_pairwise %>%
+  filter(!is.na(sig), sig != "ns") %>%
+  mutate(group1 = "Segregated", group2 = "Clustered")
+
+# bracket heights per facet (data-driven)
+stat_df_ci <- sig_rows %>%
+  group_by(CellTypeID) %>%
+  mutate(
+    data_max_ct = max(CI_df$CI[CI_df$CellTypeID == CellTypeID[1]], na.rm = TRUE),
+
+    # raise brackets a little for MDA, a lot for Myoep
+    bump = dplyr::case_when(
+      CellTypeID == "MDAMB231"      ~ 0.18,  
+      CellTypeID == "Myoepithelial" ~ 0.3,  
+      TRUE                          ~ 0.06
+    ),
+
+    y.position = pmin(1.35, data_max_ct + bump),
+    label      = sig
+  ) %>%
+  ungroup() %>%
+  select(CellTypeID, group1, group2, y.position, label)
+
+p_ci <- ggplot(CI_df, aes(x = Group, y = CI)) +
+  geom_violin(aes(fill = Group), trim = FALSE, alpha = 0.35, color = NA, width = 0.95) +
+  geom_boxplot(aes(fill = Group), width = 0.22, outlier.shape = NA, alpha = 0.85, linewidth = 0.8) +
+  geom_jitter(aes(color = Group), width = 0.15, size = 2, alpha = 0.55, show.legend = FALSE) +
+  facet_grid(. ~ CellTypeID) +
+  scale_fill_manual(values = fill_cols, drop = FALSE) +
+  scale_color_manual(values = point_cols, drop = FALSE) +
+  scale_x_discrete(labels = c("Segregated" = "Segregated", "Clustered" = "Clustered")) +
+  scale_y_continuous(
+    limits = c(0, 1.4),
+    breaks = seq(0, 1.4, by = 0.2),
+    expand = c(0, 0)
+  ) +
+  coord_cartesian(clip = "off") +
+  {
+    if (nrow(stat_df_ci) > 0) {
+      ggpubr::stat_pvalue_manual(
+        stat_df_ci,
+        xmin = "group1",
+        xmax = "group2",
+        label = "label",
+        y.position = "y.position",
+        tip.length = 0.03,
+        size = 14,
+        bracket.size = 0.9
+      )
+    } else NULL
+  } +
+  labs(
+    title = NULL,
+    x = "Spatial Arrangement",
+    y = "Travel Consistency\n(Net / Total Distance)"
+  ) +
+  theme_classic(base_size = 20) +
+  theme(
+    axis.line    = element_line(linewidth = 0.9, color = "black"),
+    axis.text.y  = element_text(size = 18),
+    axis.title.y = element_text(size = 20),
+    axis.text.x  = element_text(size = 16, angle = 0, hjust = 0.5),
+    axis.title.x = element_text(size = 16),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text.x = element_text(size = 20),
+    panel.spacing.x = unit(2, "lines"),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+ggsave(
+  filename = "TravelConsistency_Seg_Clus.png",
+  plot     = p_ci,
+  width    = 7,
+  height   = 4.7,
+  dpi      = 600
+)
+
+p_ci
+```
+
+
+## 8.) Nearest Neighbor
+```{r}
+# MDAMB231 -> nearest Myoepithelial cell
+library(RANN)
+
+frame_interval_min <- 10
+hours_per_frame <- frame_interval_min / 60
+
+CP_clean_nn <- Combined_Positions %>%
+  dplyr::mutate(
+    frame_raw = suppressWarnings(readr::parse_number(as.character(Time))) %>% as.integer(),
+    frame     = frame_raw - min(frame_raw, na.rm = TRUE), 
+    Time_hr   = frame * hours_per_frame,
+    X         = suppressWarnings(as.numeric(X_Position)),
+    Y         = suppressWarnings(as.numeric(Y_Position))
+  ) %>%
+  dplyr::filter(
+    is.finite(frame), is.finite(Time_hr), is.finite(X), is.finite(Y),
+    Group %in% c("Segregated","Clustered"),
+    CellTypeID %in% c("MDAMB231","Myoepithelial"),
+    CellTypeID != "Missing_ID"
+  )
+
+compute_nn_mda_to_myo <- function(df_clean) {
+
+  frames <- df_clean %>%
+    dplyr::group_by(SampleID, Group, frame, Time_hr) %>%
+    dplyr::group_split()
+
+  purrr::map_dfr(frames, function(df_t) {
+
+    sample_id <- df_t$SampleID[1]
+    group     <- df_t$Group[1]
+    fr        <- df_t$frame[1]
+    thr       <- df_t$Time_hr[1]
+
+    mda <- df_t %>% dplyr::filter(CellTypeID == "MDAMB231")
+    myo <- df_t %>% dplyr::filter(CellTypeID == "Myoepithelial")
+
+    if (nrow(mda) == 0 || nrow(myo) == 0) return(NULL)
+
+    mda_mat <- as.matrix(mda[, c("X","Y")])
+    myo_mat <- as.matrix(myo[, c("X","Y")])
+
+    nn <- RANN::nn2(data = myo_mat, query = mda_mat, k = 1)
+
+    idx <- nn$nn.idx[, 1]
+    d1  <- nn$nn.dists[, 1]
+
+    neighbor <- myo[idx, , drop = FALSE]
+
+    tibble::tibble(
+      SampleID       = sample_id,
+      Group          = group,
+      frame          = fr,
+      Time_hr        = thr,
+      MDA_UniqueID   = mda$UniqueID,
+      MDA_X          = mda$X,
+      MDA_Y          = mda$Y,
+      NN_Dist_um     = d1,
+      NN_UniqueID    = neighbor$UniqueID,
+      NN_CellTypeID  = neighbor$CellTypeID
+    )
+  })
+}
+
+nn_mda_to_myo <- compute_nn_mda_to_myo(CP_clean_nn)
+
+# quick sanity check
+nn_mda_to_myo %>% dplyr::count(Group) %>% print()
+nn_mda_to_myo %>% dplyr::summarise(min_d = min(NN_Dist_um, na.rm = TRUE),
+                                  max_d = max(NN_Dist_um, na.rm = TRUE)) %>% print()
+
+# summarize over time
+nn_rep_time <- nn_mda_to_myo %>%
+  dplyr::group_by(SampleID, Group, Time_hr) %>%
+  dplyr::summarise(
+    mean_dist_rep = mean(NN_Dist_um, na.rm = TRUE),
+    n_cells       = sum(is.finite(NN_Dist_um)),
+    .groups       = "drop"
+  )
+
+nn_time_summary <- nn_rep_time %>%
+  dplyr::group_by(Group, Time_hr) %>%
+  dplyr::summarise(
+    mean_dist = mean(mean_dist_rep, na.rm = TRUE),
+    sem_dist  = sd(mean_dist_rep, na.rm = TRUE) / sqrt(sum(is.finite(mean_dist_rep))),
+    n_repl    = sum(is.finite(mean_dist_rep)),
+    .groups   = "drop"
+  ) %>%
+  dplyr::mutate(Group = factor(Group, levels = c("Segregated","Clustered")))
+
+# x-axis breaks (every 6 hours)
+xmax_hr  <- max(nn_time_summary$Time_hr, na.rm = TRUE)
+x_breaks <- seq(0, ceiling(xmax_hr / 6) * 6, by = 6)
+
+p_nn_mean <- ggplot(
+  nn_time_summary,
+  aes(x = Time_hr, y = mean_dist, color = Group, fill = Group)
+) +
+  geom_ribbon(
+    aes(ymin = pmax(mean_dist - sem_dist, 0),
+        ymax = mean_dist + sem_dist),
+    alpha = 0.18,
+    color = NA
+  ) +
+  geom_line(linewidth = 1.0) +
+  scale_color_manual(values = group_colors, drop = FALSE) +
+  scale_fill_manual(values  = group_colors, drop = FALSE) +
+  scale_x_continuous(breaks = x_breaks, expand = c(0, 0)) +
+  labs(
+    x = "Time (hours)",
+    y = "TNBC to Nearest Myoepithelial \nNeighbor Mean Distance (µm)",
+    title = NULL
+  ) +
+  theme_classic(base_size = 20) +
+  theme(
+    legend.position = "right",
+    legend.title    = element_blank(),
+    legend.text     = element_text(size = 16),
+    axis.line       = element_line(linewidth = 0.9, color = "black"),
+    axis.text       = element_text(size = 18),
+    axis.title      = element_text(size = 20),
+    strip.background = element_blank()
+  )
+
+ggsave(
+  "NN_Distance_MDAMB231_to_Myoep_SegClus.png",
+  p_nn_mean, width = 10, height = 4.8, dpi = 600
+)
+
+p_nn_mean
+```
+
+
+
+# xxxxxx
+# COM for MyoEp
+```{r}
+frame_interval_min <- 10
+hours_per_frame <- frame_interval_min / 60
+
+group_cols <- group_colors  
+
+myoep_id <- "Myoepithelial"
+
+# 1) Clean positions
+cp_clean_myoep <- Combined_Positions %>%
+  dplyr::mutate(
+    frame_raw = suppressWarnings(readr::parse_number(as.character(Time))) %>% as.integer(),
+    X         = suppressWarnings(as.numeric(X_Position)),
+    Y         = suppressWarnings(as.numeric(Y_Position))
+  ) %>%
+  dplyr::filter(
+    CellTypeID == myoep_id,
+    Group %in% c("Segregated", "Clustered"),
+    is.finite(frame_raw), is.finite(X), is.finite(Y),
+    !is.na(UniqueID)
+  ) %>%
+  dplyr::arrange(SampleID, Group, UniqueID, frame_raw) %>%
+  dplyr::distinct(SampleID, UniqueID, frame_raw, .keep_all = TRUE) %>%
+  dplyr::group_by(SampleID) %>%
+  dplyr::mutate(
+    frame0     = min(frame_raw, na.rm = TRUE),
+    frame      = frame_raw - frame0,
+    Time_hours = frame * frame_interval_min / 60
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-frame0)
+
+# 2) Per-sample COM at each frame
+com_raw_myoep <- cp_clean_myoep %>%
+  dplyr::group_by(SampleID, Group, frame) %>%
+  dplyr::summarise(
+    com_x      = mean(X, na.rm = TRUE),
+    com_y      = mean(Y, na.rm = TRUE),
+    Time_hours = dplyr::first(Time_hours),
+    .groups    = "drop"
+  )
+
+# 3) Re-center per sample so t0 = (0,0)
+com_centered_myoep <- com_raw_myoep %>%
+  dplyr::group_by(SampleID, Group) %>%
+  dplyr::arrange(Time_hours, .by_group = TRUE) %>%
+  dplyr::mutate(
+    com_x0 = dplyr::first(com_x[is.finite(com_x)]),
+    com_y0 = dplyr::first(com_y[is.finite(com_y)]),
+    dx     = com_x - com_x0,
+    dy     = com_y - com_y0
+  ) %>%
+  dplyr::ungroup()
+
+# 4) Mean ± SEM across replicates (SampleID) at each timepoint
+com_summary_myoep <- com_centered_myoep %>%
+  dplyr::group_by(Group, Time_hours) %>%
+  dplyr::summarise(
+    n_repl_dx = sum(is.finite(dx)),
+    n_repl_dy = sum(is.finite(dy)),
+    dx_mean   = mean(dx, na.rm = TRUE),
+    dy_mean   = mean(dy, na.rm = TRUE),
+    dx_sem    = dplyr::if_else(n_repl_dx >= 2, sd(dx, na.rm = TRUE) / sqrt(n_repl_dx), NA_real_),
+    dy_sem    = dplyr::if_else(n_repl_dy >= 2, sd(dy, na.rm = TRUE) / sqrt(n_repl_dy), NA_real_),
+    .groups   = "drop"
+  ) %>%
+  dplyr::mutate(Group = factor(Group, levels = c("Segregated", "Clustered")))
+
+# 5) Helper to plot with fixed axis
+plot_COM_axis <- function(df, axis_label) {
+  ggplot(df, aes(x = Time_hours, y = mean, color = Group, fill = Group)) +
+    geom_hline(yintercept = 0, linewidth = 0.6, color = "grey70") +
+    geom_ribbon(aes(ymin = mean - sem, ymax = mean + sem), alpha = 0.18, color = NA) +
+    geom_line(linewidth = 1.1, na.rm = TRUE) +
+    scale_color_manual(values = group_cols, drop = FALSE) +
+    scale_x_continuous(
+      limits = c(0, 24),
+      breaks = seq(0, 24, by = 6),
+      expand = c(0, 0)
+    ) +
+    scale_fill_manual(values  = group_cols, drop = FALSE) +
+    scale_y_continuous(
+      limits = c(-200, 300),
+      breaks = seq(-200, 300, by = 50)
+    ) +
+    labs(
+      x = "Time (hours)",
+      y = axis_label
+    ) +
+    theme_classic(base_size = 20) +
+    theme(
+      axis.line    = element_line(linewidth = 0.9, color = "black"),
+      axis.text.y  = element_text(size = 18),
+      axis.title.y = element_text(size = 16),
+      axis.text.x  = element_text(size = 20, angle = 0, hjust = 0.5),
+      axis.title.x = element_text(size = 20),
+      legend.position = "right",
+      legend.title = element_text(size = 18, margin = margin(b = 4)),
+      legend.text = element_text(size = 16),
+      legend.key.height = unit(10, "pt"),
+      legend.spacing.y  = unit(2, "pt"),
+      strip.background = element_blank(),
+      strip.text.x = element_text(size = 20)
+    )
+}
+
+# ΔX plot
+dx_df_myoep <- com_summary_myoep %>%
+  dplyr::select(Group, Time_hours, mean = dx_mean, sem = dx_sem)
+
+P_COM_dx_Myoep <- plot_COM_axis(dx_df_myoep, axis_label = "ΔX Center of Mass Displacement (µm)")
+ggsave("Myoepithelial_COM_Displacement_DX.png", P_COM_dx_Myoep, width = 7.5, height = 4.8, dpi = 600)
+
+# ΔY plot
+dy_df_myoep <- com_summary_myoep %>%
+  dplyr::select(Group, Time_hours, mean = dy_mean, sem = dy_sem)
+
+P_COM_dy_Myoep <- plot_COM_axis(dy_df_myoep, axis_label = "ΔY Center of Mass Displacement (µm)")
+ggsave("Myoepithelial_COM_Displacement_DY.png", P_COM_dy_Myoep, width = 7.5, height = 4.8, dpi = 600)
+
+P_COM_dx_Myoep
+P_COM_dy_Myoep
+```
+
+```{r}
+# time-average within each SampleID (replicate)
+rep_avg_myoep <- com_centered_myoep %>%
+  filter(is.finite(dx), is.finite(dy)) %>%
+  group_by(SampleID, Group) %>%
+  summarise(
+    dX_mean = mean(dx, na.rm = TRUE),
+    dY_mean = mean(dy, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(Group = factor(Group, levels = c("Segregated", "Clustered")))
+
+df_box_myoep <- rep_avg_myoep %>%
+  tidyr::pivot_longer(
+    cols = c(dX_mean, dY_mean),
+    names_to = "Component",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Component = recode(Component, dX_mean = "ΔX (µm)", dY_mean = "ΔY (µm)"),
+    Component = factor(Component, levels = c("ΔX (µm)", "ΔY (µm)")),
+    Group     = factor(Group, levels = c("Segregated", "Clustered"))
+  )
+
+# sanity
+df_box_myoep %>% count(Component, Group)
+summary(df_box_myoep$Value)
+```
+
+```{r}
+star_from_p <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  if (p <= 0.0001) return("****")
+  if (p <= 0.001)  return("***")
+  if (p <= 0.01)   return("**")
+  if (p <= 0.05)   return("*")
+  "ns"
+}
+
+welch_COM_by_component <- function(df_box,
+                                  groups_levels = c("Segregated", "Clustered")) {
+
+  df_box %>%
+    group_by(Component) %>%
+    group_modify(function(d, key) {
+
+      d <- d %>%
+        tidyr::drop_na(Value, Group) %>%
+        mutate(Group = factor(Group, levels = groups_levels))
+
+      # require both groups and >=2 replicates per group
+      if (n_distinct(d$Group) < 2 || any(table(d$Group) < 2)) {
+        return(tibble(
+          comparison = "Segregated-Clustered",
+          direction  = NA_character_,
+          p_value    = NA_real_,
+          sig        = NA_character_,
+          statement  = paste0("Myoepithelial ", as.character(key$Component),
+                              ": Not enough replicates per group")
+        ))
+      }
+
+      tt <- t.test(Value ~ Group, data = d, var.equal = FALSE)
+      means <- tapply(d$Value, d$Group, mean, na.rm = TRUE)
+
+      dir_txt <- if (means[groups_levels[2]] > means[groups_levels[1]]) {
+        paste0(groups_levels[2], " > ", groups_levels[1])
+      } else {
+        paste0(groups_levels[1], " > ", groups_levels[2])
+      }
+
+      p <- tt$p.value
+
+      tibble(
+        comparison = "Segregated-Clustered",
+        direction  = dir_txt,
+        p_value    = p,
+        sig        = star_from_p(p),
+        statement  = paste0(
+          "Myoepithelial ", as.character(key$Component), ": ", dir_txt,
+          " (Welch t-test, p = ", signif(p, 3), ", ", star_from_p(p), ")"
+        )
+      )
+    }) %>%
+    ungroup()
+}
+
+com_stats_myoep <- welch_COM_by_component(df_box_myoep)
+
+com_stats_myoep
+com_stats_myoep$statement
+```
+
+```{r}
+fill_cols  <- group_colors
+point_cols <- point_colors
+
+sig_rows_myoep <- com_stats_myoep %>%
+  filter(!is.na(sig), sig != "ns") %>%
+  mutate(group1 = "Segregated", group2 = "Clustered")
+
+# bracket y-positions per facet (data-driven, kept inside axis)
+pval_df_myoep <- sig_rows_myoep %>%
+  group_by(Component) %>%
+  mutate(
+    ymax_comp = max(df_box_myoep$Value[df_box_myoep$Component == Component[1]], na.rm = TRUE),
+
+    bump = dplyr::case_when(
+      Component == "ΔX (µm)" ~ 6,
+      Component == "ΔY (µm)" ~ 14,
+      TRUE                   ~ 8
+    ),
+
+    y.position = pmin(72, ymax_comp + bump),
+    label = sig
+  ) %>%
+  ungroup() %>%
+  select(Component, group1, group2, y.position, label)
+
+p_timeavg_box_stars_myoep <- ggplot(df_box_myoep, aes(x = Group, y = Value, fill = Group)) +
+  geom_hline(yintercept = 0, linewidth = 0.6, color = "grey50") +
+  geom_boxplot(width = 0.6, alpha = 0.9, color = "black", outlier.shape = NA) +
+  geom_point(
+    aes(color = Group),
+    position = position_jitter(width = 0.30, height = 0),
+    size = 2.5, alpha = 0.9,
+    show.legend = FALSE
+  ) +
+  facet_grid(~ Component, switch = "x") +
+  scale_fill_manual(values = fill_cols, drop = FALSE) +
+  scale_color_manual(values = point_cols, drop = FALSE) +
+  scale_y_continuous(
+    limits = c(-100, 200),
+    breaks = seq(-100, 200, by = 50),
+    expand = c(0, 0)
+  ) +
+  {
+    if (nrow(pval_df_myoep) > 0) {
+      ggpubr::stat_pvalue_manual(
+        data       = pval_df_myoep,
+        label      = "label",
+        xmin       = "group1",
+        xmax       = "group2",
+        y.position = "y.position",
+        tip.length = 0.02,
+        size       = 12,
+        bracket.size = 0.6
+      )
+    } else NULL
+  } +
+  labs(x = NULL, y = "Time-averaged COM displacement (µm)") +
+  theme_classic(base_size = 20) +
+  theme(
+    legend.position  = "none",
+    strip.placement  = "outside",
+    strip.background = element_blank(),
+    axis.line        = element_line(linewidth = 1, color = "black"),
+    axis.text.y      = element_text(size = 16),
+    axis.title.y     = element_text(size = 15),
+    axis.text.x      = element_text(size = 16, angle = 0, hjust = 0.5),
+    strip.text.x     = element_text(size = 16, margin = margin(b = 2)),
+    panel.spacing.x = unit(2, "lines")
+  )
+
+ggsave(
+  "Myoepithelial_COM_TimeAveraged_dX_dY_boxplot_stars.png",
+  p_timeavg_box_stars_myoep,
+  width = 7.2, height = 4.4, dpi = 600
+)
+
+p_timeavg_box_stars_myoep
+```
+
+```{r}
+com_vectors_repl_myoep <- com_centered_myoep %>%
+  dplyr::filter(is.finite(Time_hours), is.finite(dx), is.finite(dy)) %>%
+  dplyr::group_by(Group, SampleID) %>%
+  dplyr::summarise(
+    Time_end = max(Time_hours, na.rm = TRUE),
+    dx_end   = dx[which.max(Time_hours)],
+    dy_end   = dy[which.max(Time_hours)],
+    bearing_deg = atan2(dy_end, dx_end) * 180 / pi,
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    Group = factor(Group, levels = c("Segregated", "Clustered"))
+  )
+
+p_repl_vec_myoep <- ggplot(com_vectors_repl_myoep, aes(color = Group)) +
+  geom_hline(yintercept = 0, linewidth = 0.4, color = "grey80") +
+  geom_vline(xintercept = 0, linewidth = 0.4, color = "grey80") +
+  geom_segment(
+    aes(x = 0, y = 0, xend = dx_end, yend = dy_end),
+    arrow = arrow(length = unit(2.2, "mm"), type = "closed"),
+    linewidth = 0.9,
+    alpha = 0.8
+  ) +
+  scale_color_manual(values = group_cols, drop = FALSE) +
+  scale_x_continuous(
+    limits = c(-200, 200),
+    breaks = seq(-200, 200, by = 50)
+  ) +
+  scale_y_continuous(
+    limits = c(-200, 200),
+    breaks = seq(-200, 200, by = 50)
+  ) +
+  coord_fixed(expand = FALSE) +
+  labs(
+    x = "ΔX COM Displacement (µm)",
+    y = "ΔY COM Displacement (µm)"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "right",
+    legend.title    = element_blank(),
+    legend.text     = element_text(size = 14),
+    axis.text       = element_text(size = 14),
+    axis.title      = element_text(size = 14),
+    axis.line       = element_line(linewidth = 0.3, color = "black")
+  )
+
+ggsave("Myoepithelial_COM_EndVectors_ByReplicate.png",
+       p_repl_vec_myoep, width = 6, height = 4, dpi = 600)
+
+p_repl_vec_myoep
+```
+

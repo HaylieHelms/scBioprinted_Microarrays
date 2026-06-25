@@ -1,9 +1,11 @@
-# Engineering Tumor Microenvironment Interactions through Single-Cell Bioprinting of Spatially Defined Cell Microarrays
+# Engineering Programmable Tumor Microenvironment Interactions through Single-Cell Bioprinting of Spatially Defined Cell Microarrays
 
 ![GA](https://github.com/user-attachments/assets/fd4cffc0-5391-42c8-820f-018453dd5b38)
 
 ## Abstract
 Cancer evolution is increasingly understood as a byproduct of dynamic interactions between malignant cells and the surrounding tumor microenvironment, with local cellular neighborhoods serving as key regulators of disease-relevant behavior. While spatial biology studies of healthy and malignant tissues have revealed spatial features correlating with clinical outcomes, the mechanisms by which individual cell interactions propagate to shape cancer evolution remain difficult to resolve in native tissues. Here, we use single-cell bioprinting to engineer tumor microenvironment interactions through spatially defined cell microarrays in which individual cells can be positioned with micrometer-scale precision and high reproducibility, enabling systematic control of cell composition, spacing, density, and spatial arrangement. As a proof of concept, we combined breast cancer cells with patient-derived myoepithelial cells to construct reductionist microenvironments and independently test how local cancer cell density and spatial organization influence tumor-relevant behavior. We show that increasing local cancer cell density suppresses myoepithelial migration while promoting greater cancer cell territorial expansion, consistent with a shift toward a more permissive microenvironment for cancer cell exploration. When cell number and relative ratio are held constant, spatial arrangement alone further alters cancer behavior by determining whether cancer cells remain locally confined within repeated short-range interactions or exhibit directional displacement toward neighboring myoepithelial populations. Together, this work establishes single-cell bioprinting of spatially defined cell microarrays as a platform for moving from correlative spatial observations to controlled and programmable determination of how individual cell interactions propagate through local cellular neighborhoods to shape cancer progression.
+
+DOI: 10.1088/1758-5090/ae7bc6
 
 ## Repository
 This repository contains the script and source data associated with the single-cell migration analysis performed in this study.
